@@ -1,0 +1,2 @@
+MORE_CMAKE_FLAGS="-DCHRONICLE_RECEIVER_NAME=chronos-writer -DADDITIONAL_PLUGINS_TARGET=/opt/src/chronos/src -DPACKAGE_NAME=chronos -DPACKAGE_VERSION=1.0" nice ./pinned_build/chronicle_pinned_build.sh /opt/src/chronicle-deps /opt/src/chronos/build $(nproc)
+
