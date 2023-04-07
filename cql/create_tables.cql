@@ -31,32 +31,36 @@ CREATE TABLE receipts
 (
  block_num              BIGINT,
  block_time             TIMESTAMP,
+ block_date             TIMESTAMP,
  seq                    BIGINT,
  account_name           ASCII,
  recv_sequence_start    BIGINT,
  recv_sequence_count    BIGINT,
- PRIMARY KEY (block_num, seq, account_name) 
+ PRIMARY KEY (block_num, seq, account_name, block_date) 
 );
 
 
 CREATE MATERIALIZED VIEW account_receipts AS
-    SELECT  block_num, block_time, seq, account_name, recv_sequence_start, recv_sequence_count
+    SELECT *    
     FROM receipts
-    WHERE account_name IS NOT NULL AND recv_sequence_start IS NOT NULL AND seq IS NOT NULL
-    PRIMARY KEY (account_name, recv_sequence_start, seq, block_num);
+    WHERE account_name IS NOT NULL AND block_date IS NOT NULL AND recv_sequence_start IS NOT NULL AND seq IS NOT NULL
+    PRIMARY KEY ((account_name, block_date), recv_sequence_start, seq, block_num);
 
-CREATE MATERIALIZED VIEW account_receipts_by_time AS
-    SELECT  block_num, block_time, seq, account_name, recv_sequence_start, recv_sequence_count
-    FROM receipts
-    WHERE account_name IS NOT NULL AND block_time IS NOT NULL AND seq IS NOT NULL
-    PRIMARY KEY (account_name, block_time, seq, block_num);
 
+CREATE TABLE recv_sequence_min
+(
+ account_name           ASCII,
+ recv_sequence_min      BIGINT,
+ block_date             TIMESTAMP,
+ PRIMARY KEY (account_name)
+);
 
 
 CREATE TABLE recv_sequence_max
 (
  account_name           ASCII,
  recv_sequence_max      BIGINT,
+ block_date             TIMESTAMP,
  PRIMARY KEY (account_name)
 );
 
@@ -65,6 +69,7 @@ CREATE TABLE actions
 (
  block_num         BIGINT,
  block_time        TIMESTAMP,
+ block_date        TIMESTAMP,
  seq               BIGINT,
  contract          ASCII,
  action            ASCII,
@@ -73,10 +78,30 @@ CREATE TABLE actions
 
 
 CREATE MATERIALIZED VIEW contract_actions AS
-    SELECT  block_num, block_time, seq, contract, action
+    SELECT *
     FROM actions
-    WHERE  contract IS NOT NULL AND action IS NOT NULL AND seq IS NOT NULL
-    PRIMARY KEY (contract, action, block_num, seq);
+    WHERE  contract IS NOT NULL AND block_date IS NOT NULL AND action IS NOT NULL AND seq IS NOT NULL
+    PRIMARY KEY ((contract, block_date), action, block_num, seq);
+
+
+CREATE TABLE action_seq_min
+(
+ contract               ASCII,
+ action                 ASCII,
+ seq_min                BIGINT,
+ block_date             TIMESTAMP,
+ PRIMARY KEY (contract, action)
+);
+
+
+CREATE TABLE action_seq_max
+(
+ contract               ASCII,
+ action                 ASCII,
+ seq_max                BIGINT,
+ block_date             TIMESTAMP,
+ PRIMARY KEY (contract, action)
+);
 
 
 

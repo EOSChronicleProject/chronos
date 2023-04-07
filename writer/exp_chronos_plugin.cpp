@@ -32,6 +32,8 @@ namespace {
   const char* SCYLLA_CONSISTENCY_OPT = "scylla-consistency";
 
   const char* CHRONOS_MAXUNACK_OPT = "chronos-max-unack";
+
+  const uint64_t MILLISECONDS_IN_A_DAY = 24 * 3600 * 1000;
 }
 
 // scylla client threads may exit after main thread, so we we need to organize a clean aborting
@@ -93,8 +95,11 @@ public:
   const CassPrepared* prepared_ins_pointers;
   const CassPrepared* prepared_ins_transactions;
   const CassPrepared* prepared_ins_receipts;
+  const CassPrepared* prepared_ins_recv_sequence_min;
   const CassPrepared* prepared_ins_recv_sequence_max;
   const CassPrepared* prepared_ins_actions;
+  const CassPrepared* prepared_ins_action_seq_min;
+  const CassPrepared* prepared_ins_action_seq_max;
   const CassPrepared* prepared_ins_abi_history;
 
   const CassPrepared* prepared_del_transactions;
@@ -120,6 +125,9 @@ public:
   uint32_t trx_counter = 0;
   uint32_t block_counter = 0;
   boost::posix_time::ptime counter_start_time;
+
+  std::set<uint64_t> recv_sequence_min_done;
+  std::set<std::tuple<uint64_t,uint64_t>> action_seq_min_done;
 
   void start() {
     std::atexit(atexit_handler);
@@ -201,65 +209,89 @@ public:
 
     future = cass_session_prepare
       (session, "INSERT INTO pointers (id, ptr) VALUES (?,?)");
-    check_future(future, "preparing statement");
+    check_future(future, "preparing ins_pointers");
     prepared_ins_pointers = cass_future_get_prepared(future);
     cass_future_free(future);
 
 
     future = cass_session_prepare
       (session, "INSERT INTO transactions (block_num, block_time, seq, trx_id, trace) VALUES (?,?,?,?,?)");
-    check_future(future, "preparing statement");
+    check_future(future, "preparing ins_transactions");
     prepared_ins_transactions = cass_future_get_prepared(future);
     cass_future_free(future);
 
 
     future = cass_session_prepare
       (session,
-       "INSERT INTO receipts (block_num, block_time, seq, account_name, recv_sequence_start, recv_sequence_count) VALUES (?,?,?,?,?,?)");
-    check_future(future, "preparing statement");
+       "INSERT INTO receipts (block_num, block_time, block_date, seq, account_name, recv_sequence_start, recv_sequence_count) VALUES (?,?,?,?,?,?,?)");
+    check_future(future, "preparing ins_receipts");
     prepared_ins_receipts = cass_future_get_prepared(future);
     cass_future_free(future);
 
 
     future = cass_session_prepare
-      (session, "INSERT INTO actions (block_num, block_time, seq, contract, action) VALUES (?,?,?,?,?)");
-    check_future(future, "preparing statement");
+      (session,
+       "INSERT INTO recv_sequence_min (account_name, recv_sequence_min, block_date) VALUES (?,?,?) IF NOT EXISTS USING TIMEOUT 10s");
+    check_future(future, "preparing ins_recv_sequence_min");
+    prepared_ins_recv_sequence_min = cass_future_get_prepared(future);
+    cass_future_free(future);
+
+
+    future = cass_session_prepare
+      (session,
+       "INSERT INTO recv_sequence_max (account_name, recv_sequence_max, block_date) VALUES (?,?,?)");
+    check_future(future, "preparing ins_recv_sequence_max");
+    prepared_ins_recv_sequence_max = cass_future_get_prepared(future);
+    cass_future_free(future);
+
+
+    future = cass_session_prepare
+      (session, "INSERT INTO actions (block_num, block_time, block_date, seq, contract, action) VALUES (?,?,?,?,?,?)");
+    check_future(future, "preparing ins_actions");
     prepared_ins_actions = cass_future_get_prepared(future);
     cass_future_free(future);
 
 
     future = cass_session_prepare
       (session,
-       "INSERT INTO recv_sequence_max (account_name, recv_sequence_max) VALUES (?,?)");
-    check_future(future, "preparing statement");
-    prepared_ins_recv_sequence_max = cass_future_get_prepared(future);
+       "INSERT INTO action_seq_min (contract, action, seq_min, block_date) VALUES (?,?,?,?) IF NOT EXISTS USING TIMEOUT 10s");
+    check_future(future, "preparing ins_action_seq_min");
+    prepared_ins_action_seq_min = cass_future_get_prepared(future);
+    cass_future_free(future);
+
+
+    future = cass_session_prepare
+      (session,
+       "INSERT INTO action_seq_max (contract, action, seq_max, block_date) VALUES (?,?,?,?)");
+    check_future(future, "preparing action_seq_max");
+    prepared_ins_action_seq_max = cass_future_get_prepared(future);
     cass_future_free(future);
 
 
     future = cass_session_prepare
       (session, "INSERT INTO abi_history (block_num, account_name, abi_raw) VALUES (?,?,?)");
-    check_future(future, "preparing statement");
+    check_future(future, "preparing ins_abi_history");
     prepared_ins_abi_history = cass_future_get_prepared(future);
     cass_future_free(future);
 
 
-    future = cass_session_prepare(session, "DELETE FROM transactions WHERE block_num=?");
-    check_future(future, "preparing statement");
+    future = cass_session_prepare(session, "DELETE FROM transactions USING TIMEOUT 10s WHERE block_num=?");
+    check_future(future, "preparing del_transactions");
     prepared_del_transactions = cass_future_get_prepared(future);
     cass_future_free(future);
 
-    future = cass_session_prepare(session, "DELETE FROM receipts WHERE block_num=?");
-    check_future(future, "preparing statement");
+    future = cass_session_prepare(session, "DELETE FROM receipts USING TIMEOUT 10s WHERE block_num=?");
+    check_future(future, "preparing del_receipts");
     prepared_del_receipts = cass_future_get_prepared(future);
     cass_future_free(future);
 
-    future = cass_session_prepare(session, "DELETE FROM actions WHERE block_num=?");
-    check_future(future, "preparing statement");
+    future = cass_session_prepare(session, "DELETE FROM actions USING TIMEOUT 10s WHERE block_num=?");
+    check_future(future, "preparing del_actions");
     prepared_del_actions = cass_future_get_prepared(future);
     cass_future_free(future);
 
-    future = cass_session_prepare(session, "DELETE FROM abi_history WHERE block_num=?");
-    check_future(future, "preparing statement");
+    future = cass_session_prepare(session, "DELETE FROM abi_history USING TIMEOUT 10s WHERE block_num=?");
+    check_future(future, "preparing del_abi_history");
     prepared_del_abi_history = cass_future_get_prepared(future);
     cass_future_free(future);
 
@@ -362,6 +394,8 @@ public:
     }
   }
 
+
+
   void on_block_started(std::shared_ptr<chronicle::channels::block_begins> bb) {
     queue_mtx.lock();
     request_queue.push({.block_num=bb->block_num, .req_counter=0});
@@ -383,11 +417,14 @@ public:
     cass_statement_free(statement);
   }
 
+
+
   void on_transaction_trace(std::shared_ptr<chronicle::channels::transaction_trace> ccttr) {
     auto& trace = std::get<eosio::ship_protocol::transaction_trace_v0>(ccttr->trace);
 
     uint64_t global_seq = 0;
     uint64_t block_timestamp = ccttr->block_timestamp.to_time_point().elapsed.count() / 1000;
+    uint64_t block_date = block_timestamp - (block_timestamp % MILLISECONDS_IN_A_DAY);
 
     std::map<uint64_t, uint64_t> recv_seq_start;
     std::map<uint64_t, uint64_t> recv_seq_max;
@@ -467,23 +504,46 @@ public:
     }
 
     for(auto item: recv_seq_start) {
-      CassStatement* statement = cass_prepared_bind(prepared_ins_receipts);
-      size_t pos = 0;
-      cass_statement_bind_int64(statement, pos++, ccttr->block_num);
-      cass_statement_bind_int64(statement, pos++, block_timestamp);
-      cass_statement_bind_int64(statement, pos++, global_seq);
-      cass_statement_bind_string(statement, pos++, eosio::name_to_string(item.first).c_str());
-      cass_statement_bind_int64(statement, pos++, item.second);
-      cass_statement_bind_int64(statement, pos++, recv_seq_max.at(item.first) - item.second + 1);
+      {
+        CassStatement* statement = cass_prepared_bind(prepared_ins_receipts);
+        size_t pos = 0;
+        cass_statement_bind_int64(statement, pos++, ccttr->block_num);
+        cass_statement_bind_int64(statement, pos++, block_timestamp);
+        cass_statement_bind_int64(statement, pos++, block_date);
+        cass_statement_bind_int64(statement, pos++, global_seq);
+        cass_statement_bind_string(statement, pos++, eosio::name_to_string(item.first).c_str());
+        cass_statement_bind_int64(statement, pos++, item.second);
+        cass_statement_bind_int64(statement, pos++, recv_seq_max.at(item.first) - item.second + 1);
 
-      queue_mtx.lock();
-      ++tracker.req_counter;
-      queue_mtx.unlock();
+        queue_mtx.lock();
+        ++tracker.req_counter;
+        queue_mtx.unlock();
 
-      CassFuture* future = cass_session_execute(session, statement);
-      cass_future_set_callback(future, scylla_result_callback, &tracker);
-      cass_future_free(future);
-      cass_statement_free(statement);
+        CassFuture* future = cass_session_execute(session, statement);
+        cass_future_set_callback(future, scylla_result_callback, &tracker);
+        cass_future_free(future);
+        cass_statement_free(statement);
+      }
+
+      if( recv_sequence_min_done.count(item.first) == 0 )
+      {
+        CassStatement* statement = cass_prepared_bind(prepared_ins_recv_sequence_min);
+        size_t pos = 0;
+        cass_statement_bind_string(statement, pos++, eosio::name_to_string(item.first).c_str());
+        cass_statement_bind_int64(statement, pos++, item.second);
+        cass_statement_bind_int64(statement, pos++, block_date);
+
+        queue_mtx.lock();
+        ++tracker.req_counter;
+        queue_mtx.unlock();
+
+        CassFuture* future = cass_session_execute(session, statement);
+        cass_future_set_callback(future, scylla_result_callback, &tracker);
+        cass_future_free(future);
+        cass_statement_free(statement);
+
+        recv_sequence_min_done.insert(item.first);
+      }
     }
 
     for(auto item: recv_seq_max) {
@@ -491,6 +551,7 @@ public:
       size_t pos = 0;
       cass_statement_bind_string(statement, pos++, eosio::name_to_string(item.first).c_str());
       cass_statement_bind_int64(statement, pos++, item.second);
+      cass_statement_bind_int64(statement, pos++, block_date);
 
       queue_mtx.lock();
       ++tracker.req_counter;
@@ -504,33 +565,94 @@ public:
 
     for(auto item: actions_seen) {
       for(auto aname: item.second) {
-        CassStatement* statement = cass_prepared_bind(prepared_ins_actions);
-        size_t pos = 0;
-        cass_statement_bind_int64(statement, pos++, ccttr->block_num);
-        cass_statement_bind_int64(statement, pos++, block_timestamp);
-        cass_statement_bind_int64(statement, pos++, global_seq);
-        cass_statement_bind_string(statement, pos++, eosio::name_to_string(item.first).c_str());
-        cass_statement_bind_string(statement, pos++, eosio::name_to_string(aname).c_str());
+        std::tuple<uint64_t,uint64_t> contract_and_action(item.first, aname);
+
+        if( action_seq_min_done.count(contract_and_action) == 0 ) {
+          CassStatement* statement = cass_prepared_bind(prepared_ins_action_seq_min);
+          size_t pos = 0;
+          cass_statement_bind_string(statement, pos++, eosio::name_to_string(item.first).c_str());
+          cass_statement_bind_string(statement, pos++, eosio::name_to_string(aname).c_str());
+          cass_statement_bind_int64(statement, pos++, global_seq);
+          cass_statement_bind_int64(statement, pos++, block_date);
+
+          queue_mtx.lock();
+          ++tracker.req_counter;
+          queue_mtx.unlock();
+
+          CassFuture* future = cass_session_execute(session, statement);
+          cass_future_set_callback(future, scylla_result_callback, &tracker);
+          cass_future_free(future);
+          cass_statement_free(statement);
+
+          action_seq_min_done.insert(contract_and_action);
+        }
 
         queue_mtx.lock();
-        ++tracker.req_counter;
+        tracker.req_counter += 2;
         queue_mtx.unlock();
 
-        CassFuture* future = cass_session_execute(session, statement);
-        cass_future_set_callback(future, scylla_result_callback, &tracker);
-        cass_future_free(future);
-        cass_statement_free(statement);
+        {
+          CassStatement* statement = cass_prepared_bind(prepared_ins_actions);
+          size_t pos = 0;
+          cass_statement_bind_int64(statement, pos++, ccttr->block_num);
+          cass_statement_bind_int64(statement, pos++, block_timestamp);
+          cass_statement_bind_int64(statement, pos++, block_date);
+          cass_statement_bind_int64(statement, pos++, global_seq);
+          cass_statement_bind_string(statement, pos++, eosio::name_to_string(item.first).c_str());
+          cass_statement_bind_string(statement, pos++, eosio::name_to_string(aname).c_str());
+
+          CassFuture* future = cass_session_execute(session, statement);
+          cass_future_set_callback(future, scylla_result_callback, &tracker);
+          cass_future_free(future);
+          cass_statement_free(statement);
+        }
+
+        {
+          CassStatement* statement = cass_prepared_bind(prepared_ins_action_seq_max);
+          size_t pos = 0;
+          cass_statement_bind_string(statement, pos++, eosio::name_to_string(item.first).c_str());
+          cass_statement_bind_string(statement, pos++, eosio::name_to_string(aname).c_str());
+          cass_statement_bind_int64(statement, pos++, global_seq);
+          cass_statement_bind_int64(statement, pos++, block_date);
+
+          CassFuture* future = cass_session_execute(session, statement);
+          cass_future_set_callback(future, scylla_result_callback, &tracker);
+          cass_future_free(future);
+          cass_statement_free(statement);
+        }
       }
     }
 
     trx_counter++;
   }
 
+
   void on_abi_update(std::shared_ptr<chronicle::channels::abi_update> abiupd) {
+    CassStatement* statement = cass_prepared_bind(prepared_ins_abi_history);
+    size_t pos = 0;
+    cass_statement_bind_int64(statement, pos++, abiupd->block_num);
+    cass_statement_bind_string(statement, pos++, eosio::name_to_string(abiupd->account.value).c_str());
+    cass_statement_bind_bytes(statement, pos++, (cass_byte_t*) abiupd->bin_start, abiupd->bin_size);
+    CassFuture* future = cass_session_execute(session, statement);
+    check_future(future, "inserting abi_history");
+    cass_future_free(future);
+    cass_statement_free(statement);
   }
 
+
   void on_abi_removal(std::shared_ptr<chronicle::channels::abi_removal> ar) {
+    CassStatement* statement = cass_prepared_bind(prepared_ins_abi_history);
+    size_t pos = 0;
+    cass_statement_bind_int64(statement, pos++, ar->block_num);
+    cass_statement_bind_string(statement, pos++, eosio::name_to_string(ar->account.value).c_str());
+    string empty;
+    cass_statement_bind_bytes(statement, pos++, (cass_byte_t*) empty.data(), 0);
+    CassFuture* future = cass_session_execute(session, statement);
+    check_future(future, "inserting empty abi_history");
+    cass_future_free(future);
+    cass_statement_free(statement);
   }
+
 
   void on_receiver_pause(std::shared_ptr<chronicle::channels::receiver_pause> rp) {
     ack_finished_blocks();
