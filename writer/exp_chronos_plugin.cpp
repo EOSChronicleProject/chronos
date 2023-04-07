@@ -248,10 +248,9 @@ public:
       ilog("Bootstrapping an empty database: writing all known ABI history");
       uint32_t count = 0;
 
-      CassStatement* statement = cass_prepared_bind(prepared_ins_abi_history);
-
       receiver_plug->walk_abi_history([&](uint64_t account, uint32_t block_index,
                                              const char* abi_data, size_t abi_size) {
+        CassStatement* statement = cass_prepared_bind(prepared_ins_abi_history);
         size_t pos = 0;
         cass_statement_bind_int64(statement, pos++, block_index);
         cass_statement_bind_string(statement, pos++, eosio::name_to_string(account).c_str());
@@ -259,10 +258,10 @@ public:
         future = cass_session_execute(session, statement);
         check_future(future, "inserting abi_history");
         cass_future_free(future);
+        cass_statement_free(statement);
         ++count;
       });
 
-      cass_statement_free(statement);
       ilog("Wrote ${c} abi_history rows", ("c",count));
     }
 
@@ -366,27 +365,29 @@ public:
     }
 
     auto trx_id = trace.id.extract_as_byte_array();
-
-    CassStatement* statement = cass_prepared_bind(prepared_ins_transactions);
-    size_t pos = 0;
-    cass_statement_bind_int64(statement, pos++, ccttr->block_num);
-    cass_statement_bind_int64(statement, pos++, block_timestamp);
-    cass_statement_bind_int64(statement, pos++, global_seq);
-    cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)trx_id.data(), trx_id.size());
-    cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)ccttr->bin_start, ccttr->bin_size);
-
     req_queue_entry& tracker = request_queue.back();
-    queue_mtx.lock();
-    ++tracker.req_counter;
-    queue_mtx.unlock();
 
-    CassFuture* future = cass_session_execute(session, statement);
-    cass_future_set_callback(future, scylla_result_callback, &tracker);
-    cass_future_free(future);
-    cass_statement_free(statement);
+    {
+      CassStatement* statement = cass_prepared_bind(prepared_ins_transactions);
+      size_t pos = 0;
+      cass_statement_bind_int64(statement, pos++, ccttr->block_num);
+      cass_statement_bind_int64(statement, pos++, block_timestamp);
+      cass_statement_bind_int64(statement, pos++, global_seq);
+      cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)trx_id.data(), trx_id.size());
+      cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)ccttr->bin_start, ccttr->bin_size);
 
-    statement = cass_prepared_bind(prepared_ins_receipts);
+      queue_mtx.lock();
+      ++tracker.req_counter;
+      queue_mtx.unlock();
+
+      CassFuture* future = cass_session_execute(session, statement);
+      cass_future_set_callback(future, scylla_result_callback, &tracker);
+      cass_future_free(future);
+      cass_statement_free(statement);
+    }
+
     for(auto item: recv_seq_start) {
+      CassStatement* statement = cass_prepared_bind(prepared_ins_receipts);
       size_t pos = 0;
       cass_statement_bind_int64(statement, pos++, ccttr->block_num);
       cass_statement_bind_int64(statement, pos++, block_timestamp);
@@ -399,15 +400,14 @@ public:
       ++tracker.req_counter;
       queue_mtx.unlock();
 
-      future = cass_session_execute(session, statement);
+      CassFuture* future = cass_session_execute(session, statement);
       cass_future_set_callback(future, scylla_result_callback, &tracker);
       cass_future_free(future);
+      cass_statement_free(statement);
     }
-    cass_statement_free(statement);
 
-
-    statement = cass_prepared_bind(prepared_ins_recv_sequence_max);
     for(auto item: recv_seq_max) {
+      CassStatement* statement = cass_prepared_bind(prepared_ins_recv_sequence_max);
       size_t pos = 0;
       cass_statement_bind_string(statement, pos++, eosio::name_to_string(item.first).c_str());
       cass_statement_bind_int64(statement, pos++, item.second);
@@ -416,15 +416,15 @@ public:
       ++tracker.req_counter;
       queue_mtx.unlock();
 
-      future = cass_session_execute(session, statement);
+      CassFuture* future = cass_session_execute(session, statement);
       cass_future_set_callback(future, scylla_result_callback, &tracker);
       cass_future_free(future);
+      cass_statement_free(statement);
     }
-    cass_statement_free(statement);
 
-    statement = cass_prepared_bind(prepared_ins_actions);
     for(auto item: actions_seen) {
       for(auto aname: item.second) {
+        CassStatement* statement = cass_prepared_bind(prepared_ins_actions);
         size_t pos = 0;
         cass_statement_bind_int64(statement, pos++, ccttr->block_num);
         cass_statement_bind_int64(statement, pos++, block_timestamp);
@@ -436,12 +436,12 @@ public:
         ++tracker.req_counter;
         queue_mtx.unlock();
 
-        future = cass_session_execute(session, statement);
+        CassFuture* future = cass_session_execute(session, statement);
         cass_future_set_callback(future, scylla_result_callback, &tracker);
         cass_future_free(future);
+        cass_statement_free(statement);
       }
     }
-    cass_statement_free(statement);
   }
 
   void on_abi_update(std::shared_ptr<chronicle::channels::abi_update> abiupd) {
