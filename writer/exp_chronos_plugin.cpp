@@ -21,8 +21,6 @@ using std::string;
 
 static auto _exp_chronos_plugin = app().register_plugin<exp_chronos_plugin>();
 
-static boost::mutex queue_mtx;
-
 namespace {
   const char* SCYLLA_HOSTS_OPT = "scylla-hosts";
   const char* SCYLLA_PORT_OPT = "scylla-port";
@@ -35,6 +33,15 @@ namespace {
   const char* CHRONOS_MAXUNACK_OPT = "chronos-max-unack";
 }
 
+// scylla client threads may exit after main thread, so we we need to organize a clean aborting
+
+static boost::mutex queue_mtx;
+static bool is_exiting = false;
+
+void atexit_handler()
+{
+  is_exiting = true;
+}
 
 // tracker for ScyllaDB asynchronous requests
 struct req_queue_entry {
@@ -45,18 +52,20 @@ struct req_queue_entry {
 
 void scylla_result_callback(CassFuture* future, void* data)
 {
-  if (cass_future_error_code(future) != CASS_OK) {
-    const char* message;
-    size_t message_length;
-    cass_future_error_message(future, &message, &message_length);
-    string msg(message, message_length);
-    elog("Error: ${e}", ("e",msg));
-    abort_receiver();
-  }
+  if( !is_exiting ) {
+    if (cass_future_error_code(future) != CASS_OK) {
+      const char* message;
+      size_t message_length;
+      cass_future_error_message(future, &message, &message_length);
+      string msg(message, message_length);
+      elog("Error: ${e}", ("e",msg));
+      abort_receiver();
+    }
 
-  queue_mtx.lock();
-  ((req_queue_entry*)data)->req_counter--;
-  queue_mtx.unlock();
+    queue_mtx.lock();
+    ((req_queue_entry*)data)->req_counter--;
+    queue_mtx.unlock();
+  }
 }
 
 
@@ -103,7 +112,13 @@ public:
 
   std::queue<req_queue_entry> request_queue;
 
+
+  uint32_t trx_counter = 0;
+  uint32_t block_counter = 0;
+  boost::posix_time::ptime counter_start_time;
+
   void start() {
+    std::atexit(atexit_handler);
     exporter_will_ack_blocks(maxunack);
 
     _forks_subscription =
@@ -265,6 +280,7 @@ public:
       ilog("Wrote ${c} abi_history rows", ("c",count));
     }
 
+    counter_start_time = boost::posix_time::second_clock::local_time();
   }
 
   void check_future(CassFuture* future, const string what) {
@@ -442,6 +458,8 @@ public:
         cass_statement_free(statement);
       }
     }
+
+    trx_counter++;
   }
 
   void on_abi_update(std::shared_ptr<chronicle::channels::abi_update> abiupd) {
@@ -464,12 +482,25 @@ public:
     while( request_queue.front().req_counter == 0 ) {
       ack = request_queue.front().block_num;
       request_queue.pop();
+      block_counter++;
     }
     queue_mtx.unlock();
 
     if( ack > 0 ) {
       ack_block(ack);
-      ilog("Ack ${a}", ("a", ack));
+
+      if( block_counter >= 100 ) {
+        boost::posix_time::ptime now = boost::posix_time::second_clock::local_time();
+        boost::posix_time::time_duration diff = now - counter_start_time;
+        uint32_t millisecs = diff.total_milliseconds();
+
+        ilog("ack ${a}, blocks/s: ${b}, trx/s: ${t}",
+             ("a", ack)("b", block_counter*1000/millisecs)("t", trx_counter*1000/millisecs));
+
+        counter_start_time = now;
+        block_counter = 0;
+        trx_counter = 0;
+      }
     }
   }
 };
