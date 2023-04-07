@@ -7,6 +7,7 @@
 #include <string>
 #include <sstream>
 #include <boost/thread/mutex.hpp>
+#include <boost/asio/deadline_timer.hpp>
 
 #include <fc/log/logger.hpp>
 #include <fc/exception/exception.hpp>
@@ -71,7 +72,8 @@ void scylla_result_callback(CassFuture* future, void* data)
 
 class exp_chronos_plugin_impl : std::enable_shared_from_this<exp_chronos_plugin_impl> {
 public:
-  exp_chronos_plugin_impl()
+  exp_chronos_plugin_impl():
+    fork_pause_timer(app().get_io_service())
   {}
 
   string scylla_hosts;
@@ -110,8 +112,10 @@ public:
 
   const int channel_priority = 55;
 
-  std::queue<req_queue_entry> request_queue;
+  std::queue<req_queue_entry>        request_queue;
+  boost::asio::deadline_timer        fork_pause_timer;
 
+  uint32_t written_irreversible = 0;
 
   uint32_t trx_counter = 0;
   uint32_t block_counter = 0;
@@ -168,6 +172,7 @@ public:
     cass_cluster_set_contact_points(cluster, scylla_hosts.c_str());
     cass_cluster_set_local_port_range(cluster, 49152, 65535);
     cass_cluster_set_core_connections_per_host(cluster, scylla_conn_per_host);
+    cass_cluster_set_request_timeout(cluster, 0);
 
     if( scylla_username.size() > 0 ) {
       cass_cluster_set_credentials(cluster, scylla_username.c_str(), scylla_password.c_str());
@@ -295,7 +300,66 @@ public:
   }
 
   void on_fork(std::shared_ptr<chronicle::channels::fork_event> fe) {
-    ack_block(fe->block_num - 1);
+    queue_mtx.lock();
+    while( !request_queue.empty() && request_queue.front().req_counter == 0 ) {
+      request_queue.pop();
+    }
+    queue_mtx.unlock();
+
+    size_t queue_size = request_queue.size();
+    if( queue_size > 0 ) {
+      ilog("ScyllaDB queue size is ${s}. Pausing the fork handling", ("s", queue_size));
+      fork_pause_timer.expires_from_now(boost::posix_time::milliseconds(200));
+      fork_pause_timer.async_wait(boost::bind(&exp_chronos_plugin_impl::on_fork, this, fe));
+    }
+    else {
+      int64_t last_written_block = 0;
+
+      CassStatement* statement = cass_statement_new("SELECT ptr FROM pointers WHERE id=0", 0);
+      CassFuture* future = cass_session_execute(session, statement);
+      check_future(future, "quering");
+      const CassResult* result = cass_future_get_result(future);
+      if( cass_result_row_count(result) > 0 ) {
+        const CassRow* row = cass_result_first_row(result);
+        const CassValue* column1 = cass_row_get_column(row, 0);
+        cass_value_get_int64(column1,  &last_written_block);
+      }
+      cass_result_free(result);
+      cass_statement_free(statement);
+      cass_future_free(future);
+
+      ilog("last_written_block: ${b}", ("b", last_written_block));
+
+      if( last_written_block > 0 ) { // delete all written data down to the forked block
+        ilog("Deleting data between blocks ${s} and ${e}", ("s", fe->block_num)("e", last_written_block));
+
+        while( last_written_block >= fe->block_num ) {
+          statement = cass_prepared_bind(prepared_del_transactions);
+          cass_statement_bind_int64(statement, 0, last_written_block);
+          future = cass_session_execute(session, statement);
+          check_future(future, "deleting forked transactions");
+
+          statement = cass_prepared_bind(prepared_del_receipts);
+          cass_statement_bind_int64(statement, 0, last_written_block);
+          future = cass_session_execute(session, statement);
+          check_future(future, "deleting forked receipts");
+
+          statement = cass_prepared_bind(prepared_del_actions);
+          cass_statement_bind_int64(statement, 0, last_written_block);
+          future = cass_session_execute(session, statement);
+          check_future(future, "deleting forked actions");
+
+          statement = cass_prepared_bind(prepared_del_abi_history);
+          cass_statement_bind_int64(statement, 0, last_written_block);
+          future = cass_session_execute(session, statement);
+          check_future(future, "deleting forked abi_history");
+
+          last_written_block--;
+        }
+      }
+
+      ack_block(fe->block_num - 1);
+    }
   }
 
   void on_block_started(std::shared_ptr<chronicle::channels::block_begins> bb) {
@@ -473,13 +537,49 @@ public:
   }
 
   void on_block_completed(std::shared_ptr<block_finished> bf) {
+    if( is_bootstrapping ) {
+      CassStatement* statement = cass_prepared_bind(prepared_ins_pointers);
+      size_t pos = 0;
+      cass_statement_bind_int32(statement, pos++, 2); // id=2: lowest block in history
+      cass_statement_bind_int64(statement, pos++, bf->block_num);
+
+      req_queue_entry& tracker = request_queue.back();
+      queue_mtx.lock();
+      ++tracker.req_counter;
+      queue_mtx.unlock();
+
+      CassFuture* future = cass_session_execute(session, statement);
+      cass_future_set_callback(future, scylla_result_callback, &tracker);
+      cass_future_free(future);
+      cass_statement_free(statement);
+    }
+
+    if( bf->last_irreversible > written_irreversible ) {
+      CassStatement* statement = cass_prepared_bind(prepared_ins_pointers);
+      size_t pos = 0;
+      cass_statement_bind_int32(statement, pos++, 1); // id=1: irreversible block,
+      cass_statement_bind_int64(statement, pos++, bf->block_num);
+
+      req_queue_entry& tracker = request_queue.back();
+      queue_mtx.lock();
+      ++tracker.req_counter;
+      queue_mtx.unlock();
+
+      CassFuture* future = cass_session_execute(session, statement);
+      cass_future_set_callback(future, scylla_result_callback, &tracker);
+      cass_future_free(future);
+      cass_statement_free(statement);
+
+      written_irreversible = bf->last_irreversible;
+    }
+
     ack_finished_blocks();
   }
 
   void ack_finished_blocks() {
     uint32_t ack = 0;
     queue_mtx.lock();
-    while( request_queue.front().req_counter == 0 ) {
+    while( !request_queue.empty() && request_queue.front().req_counter == 0 ) {
       ack = request_queue.front().block_num;
       request_queue.pop();
       block_counter++;
@@ -489,17 +589,19 @@ public:
     if( ack > 0 ) {
       ack_block(ack);
 
-      if( block_counter >= 100 ) {
+      if( block_counter >= 200 ) {
         boost::posix_time::ptime now = boost::posix_time::second_clock::local_time();
         boost::posix_time::time_duration diff = now - counter_start_time;
         uint32_t millisecs = diff.total_milliseconds();
 
-        ilog("ack ${a}, blocks/s: ${b}, trx/s: ${t}",
-             ("a", ack)("b", block_counter*1000/millisecs)("t", trx_counter*1000/millisecs));
+        if( millisecs > 0 ) {
+          ilog("ack ${a}, blocks/s: ${b}, trx/s: ${t}",
+               ("a", ack)("b", block_counter*1000/millisecs)("t", trx_counter*1000/millisecs));
 
-        counter_start_time = now;
-        block_counter = 0;
-        trx_counter = 0;
+          counter_start_time = now;
+          block_counter = 0;
+          trx_counter = 0;
+        }
       }
     }
   }
