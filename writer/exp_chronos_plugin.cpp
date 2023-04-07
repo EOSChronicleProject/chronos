@@ -125,6 +125,28 @@ public:
 
     if( is_bootstrapping ) {
       ilog("Bootstrapping an empty database: writing all known ABI history");
+      uint32_t count = 0;
+
+      future = cass_session_prepare
+        (session, "INSERT INTO abi_history (block_num, account_name, abi_raw) VALUES (?,?,?)");
+      check_future(future, "preparing statement");
+      const CassPrepared* prepared = cass_future_get_prepared(future);
+      cass_future_free(future);
+      CassStatement* statement = cass_prepared_bind(prepared);
+      
+      receiver_plug->walk_abi_history([&](uint64_t account, uint32_t block_index,
+                                             const char* abi_data, size_t abi_size) {
+        cass_statement_bind_int64(statement, 0, block_index);
+        cass_statement_bind_string(statement, 1, eosio::name_to_string(account).c_str());
+        cass_statement_bind_bytes(statement, 2, (cass_byte_t*) abi_data, abi_size);
+        future = cass_session_execute(session, statement);
+        check_future(future, "inserting abi_history");
+        cass_future_free(future);
+        ++count;
+      });
+
+      cass_prepared_free(prepared);
+      ilog("Wrote ${c} abi_history rows", ("c",count));
     }
 
   }
