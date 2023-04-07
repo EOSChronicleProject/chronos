@@ -6,6 +6,7 @@
 #include <iostream>
 #include <string>
 #include <sstream>
+#include <boost/thread/mutex.hpp>
 
 #include <fc/log/logger.hpp>
 #include <fc/exception/exception.hpp>
@@ -19,6 +20,8 @@ using std::make_shared;
 using std::string;
 
 static auto _exp_chronos_plugin = app().register_plugin<exp_chronos_plugin>();
+
+static boost::mutex queue_mtx;
 
 namespace {
   const char* SCYLLA_HOSTS_OPT = "scylla-hosts";
@@ -51,7 +54,9 @@ void scylla_result_callback(CassFuture* future, void* data)
     abort_receiver();
   }
 
+  queue_mtx.lock();
   ((req_queue_entry*)data)->req_counter--;
+  queue_mtx.unlock();
 }
 
 
@@ -91,6 +96,7 @@ public:
   chronicle::channels::transaction_traces::channel_type::handle  _transaction_traces_subscription;
   chronicle::channels::abi_removals::channel_type::handle        _abi_removals_subscription;
   chronicle::channels::abi_updates::channel_type::handle         _abi_updates_subscription;
+  chronicle::channels::receiver_pauses::channel_type::handle     _receiver_pauses_subscription;
   chronicle::channels::block_completed::channel_type::handle     _block_completed_subscription;
 
   const int channel_priority = 55;
@@ -128,6 +134,12 @@ public:
       app().get_channel<chronicle::channels::abi_removals>().subscribe
       ([this](std::shared_ptr<chronicle::channels::abi_removal> ar){
         on_abi_removal(ar);
+      });
+
+    _receiver_pauses_subscription =
+      app().get_channel<chronicle::channels::receiver_pauses>().subscribe
+      ([this](std::shared_ptr<chronicle::channels::receiver_pause> rp){
+        on_receiver_pause(rp);
       });
 
     _block_completed_subscription =
@@ -272,7 +284,9 @@ public:
   }
 
   void on_block_started(std::shared_ptr<chronicle::channels::block_begins> bb) {
+    queue_mtx.lock();
     request_queue.push({.block_num=bb->block_num, .req_counter=0});
+    queue_mtx.unlock();
 
     CassStatement* statement = cass_prepared_bind(prepared_ins_pointers);
     size_t pos = 0;
@@ -280,7 +294,9 @@ public:
     cass_statement_bind_int64(statement, pos++, bb->block_num); // id=0: last written block
 
     req_queue_entry& tracker = request_queue.back();
+    queue_mtx.lock();
     ++tracker.req_counter;
+    queue_mtx.unlock();
 
     CassFuture* future = cass_session_execute(session, statement);
     cass_future_set_callback(future, scylla_result_callback, &tracker);
@@ -360,7 +376,9 @@ public:
     cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)ccttr->bin_start, ccttr->bin_size);
 
     req_queue_entry& tracker = request_queue.back();
+    queue_mtx.lock();
     ++tracker.req_counter;
+    queue_mtx.unlock();
 
     CassFuture* future = cass_session_execute(session, statement);
     cass_future_set_callback(future, scylla_result_callback, &tracker);
@@ -377,7 +395,9 @@ public:
       cass_statement_bind_int64(statement, pos++, item.second);
       cass_statement_bind_int64(statement, pos++, recv_seq_max.at(item.first) - item.second + 1);
 
+      queue_mtx.lock();
       ++tracker.req_counter;
+      queue_mtx.unlock();
 
       future = cass_session_execute(session, statement);
       cass_future_set_callback(future, scylla_result_callback, &tracker);
@@ -392,7 +412,9 @@ public:
       cass_statement_bind_string(statement, pos++, eosio::name_to_string(item.first).c_str());
       cass_statement_bind_int64(statement, pos++, item.second);
 
+      queue_mtx.lock();
       ++tracker.req_counter;
+      queue_mtx.unlock();
 
       future = cass_session_execute(session, statement);
       cass_future_set_callback(future, scylla_result_callback, &tracker);
@@ -410,7 +432,9 @@ public:
         cass_statement_bind_string(statement, pos++, eosio::name_to_string(item.first).c_str());
         cass_statement_bind_string(statement, pos++, eosio::name_to_string(aname).c_str());
 
+        queue_mtx.lock();
         ++tracker.req_counter;
+        queue_mtx.unlock();
 
         future = cass_session_execute(session, statement);
         cass_future_set_callback(future, scylla_result_callback, &tracker);
@@ -426,15 +450,26 @@ public:
   void on_abi_removal(std::shared_ptr<chronicle::channels::abi_removal> ar) {
   }
 
+  void on_receiver_pause(std::shared_ptr<chronicle::channels::receiver_pause> rp) {
+    ack_finished_blocks();
+  }
+
   void on_block_completed(std::shared_ptr<block_finished> bf) {
+    ack_finished_blocks();
+  }
+
+  void ack_finished_blocks() {
     uint32_t ack = 0;
+    queue_mtx.lock();
     while( request_queue.front().req_counter == 0 ) {
       ack = request_queue.front().block_num;
       request_queue.pop();
     }
+    queue_mtx.unlock();
 
     if( ack > 0 ) {
       ack_block(ack);
+      ilog("Ack ${a}", ("a", ack));
     }
   }
 };
