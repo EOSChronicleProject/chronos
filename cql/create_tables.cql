@@ -47,22 +47,13 @@ CREATE MATERIALIZED VIEW account_receipts AS
     PRIMARY KEY ((account_name, block_date), recv_sequence_start, seq, block_num);
 
 
-CREATE TABLE recv_sequence_min
+CREATE TABLE receipt_dates
 (
  account_name           ASCII,
- recv_sequence_min      BIGINT,
  block_date             BIGINT,
- PRIMARY KEY (account_name)
+ PRIMARY KEY (account_name, block_date)
 );
 
-
-CREATE TABLE recv_sequence_max
-(
- account_name           ASCII,
- recv_sequence_max      BIGINT,
- block_date             BIGINT,
- PRIMARY KEY (account_name)
-);
 
 
 CREATE TABLE actions
@@ -84,23 +75,12 @@ CREATE MATERIALIZED VIEW contract_actions AS
     PRIMARY KEY ((contract, block_date), action, block_num, seq);
 
 
-CREATE TABLE action_seq_min
+CREATE TABLE action_dates
 (
  contract               ASCII,
  action                 ASCII,
- seq_min                BIGINT,
  block_date             BIGINT,
- PRIMARY KEY (contract, action)
-);
-
-
-CREATE TABLE action_seq_max
-(
- contract               ASCII,
- action                 ASCII,
- seq_max                BIGINT,
- block_date             BIGINT,
- PRIMARY KEY (contract, action)
+ PRIMARY KEY ((contract, action), block_date)
 );
 
 
