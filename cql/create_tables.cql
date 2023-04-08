@@ -31,7 +31,7 @@ CREATE TABLE receipts
 (
  block_num              BIGINT,
  block_time             TIMESTAMP,
- block_date             TIMESTAMP,
+ block_date             BIGINT,
  seq                    BIGINT,
  account_name           ASCII,
  recv_sequence_start    BIGINT,
@@ -51,7 +51,7 @@ CREATE TABLE recv_sequence_min
 (
  account_name           ASCII,
  recv_sequence_min      BIGINT,
- block_date             TIMESTAMP,
+ block_date             BIGINT,
  PRIMARY KEY (account_name)
 );
 
@@ -60,7 +60,7 @@ CREATE TABLE recv_sequence_max
 (
  account_name           ASCII,
  recv_sequence_max      BIGINT,
- block_date             TIMESTAMP,
+ block_date             BIGINT,
  PRIMARY KEY (account_name)
 );
 
@@ -69,7 +69,7 @@ CREATE TABLE actions
 (
  block_num         BIGINT,
  block_time        TIMESTAMP,
- block_date        TIMESTAMP,
+ block_date        BIGINT,
  seq               BIGINT,
  contract          ASCII,
  action            ASCII,
@@ -89,7 +89,7 @@ CREATE TABLE action_seq_min
  contract               ASCII,
  action                 ASCII,
  seq_min                BIGINT,
- block_date             TIMESTAMP,
+ block_date             BIGINT,
  PRIMARY KEY (contract, action)
 );
 
@@ -99,7 +99,7 @@ CREATE TABLE action_seq_max
  contract               ASCII,
  action                 ASCII,
  seq_max                BIGINT,
- block_date             TIMESTAMP,
+ block_date             BIGINT,
  PRIMARY KEY (contract, action)
 );
 
