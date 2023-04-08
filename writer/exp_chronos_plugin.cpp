@@ -317,7 +317,7 @@ public:
       ilog("Wrote ${c} abi_history rows", ("c",count));
     }
 
-    counter_start_time = boost::posix_time::second_clock::local_time();
+    counter_start_time = boost::posix_time::microsec_clock::local_time();
   }
 
   void check_future(CassFuture* future, const string what) {
@@ -712,13 +712,13 @@ public:
       ack_block(ack);
 
       if( block_counter >= 200 ) {
-        boost::posix_time::ptime now = boost::posix_time::second_clock::local_time();
+        boost::posix_time::ptime now = boost::posix_time::microsec_clock::local_time();
         boost::posix_time::time_duration diff = now - counter_start_time;
         uint32_t millisecs = diff.total_milliseconds();
 
         if( millisecs > 0 ) {
           ilog("ack ${a}, blocks/s: ${b}, trx/s: ${t}",
-               ("a", ack)("b", block_counter*1000/millisecs)("t", trx_counter*1000/millisecs));
+               ("a", ack)("b", 1000*block_counter/millisecs)("t", 1000*trx_counter/millisecs));
 
           counter_start_time = now;
           block_counter = 0;
