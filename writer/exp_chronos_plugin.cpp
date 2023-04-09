@@ -633,6 +633,8 @@ public:
       cass_future_set_callback(future, scylla_result_callback, &tracker);
       cass_future_free(future);
       cass_statement_free(statement);
+
+      is_bootstrapping = false;
     }
 
     if( bf->last_irreversible > written_irreversible ) {
