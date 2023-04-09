@@ -82,9 +82,16 @@ void scylla_result_callback(CassFuture* future, void* data)
 class exp_chronos_plugin_impl : std::enable_shared_from_this<exp_chronos_plugin_impl> {
 public:
   exp_chronos_plugin_impl():
-    traces_worker(boost::asio::make_work_guard(traces_io_service)),
-    fork_pause_timer(traces_io_service)
+    traces_io_context(),
+    traces_worker(boost::asio::make_work_guard(traces_io_context)),
+    fork_pause_timer(app().get_io_service())
   {}
+
+  ~exp_chronos_plugin_impl() {
+    traces_worker.reset();
+    traces_thread_group.join_all();
+  }
+
 
   string scylla_hosts;
   uint16_t scylla_port;
@@ -124,9 +131,9 @@ public:
   const int channel_priority = 55;
 
   std::queue<std::shared_ptr<req_queue_entry>>        request_queue;
-  boost::asio::io_service            traces_io_service;
+  boost::asio::io_context            traces_io_context;
   boost::asio::executor_work_guard<boost::asio::io_context::executor_type> traces_worker;
-  size_t trace_treads = 4;
+  size_t trace_treads = 1;
   boost::thread_group                traces_thread_group;
 
   boost::asio::deadline_timer        fork_pause_timer;
@@ -316,7 +323,7 @@ public:
     }
 
     for(size_t i=0; i < trace_treads; ++i) {
-      traces_thread_group.create_thread(boost::bind(&boost::asio::io_service::run, &traces_io_service));
+      traces_thread_group.create_thread(boost::bind(&boost::asio::io_context::run, &traces_io_context));
     }
 
     counter_start_time = boost::posix_time::microsec_clock::local_time();
@@ -372,21 +379,29 @@ public:
           cass_statement_bind_int64(statement, 0, last_written_block);
           future = cass_session_execute(session, statement);
           check_future(future, "deleting forked transactions");
+          cass_future_free(future);
+          cass_statement_free(statement);
 
           statement = cass_prepared_bind(prepared_del_receipts);
           cass_statement_bind_int64(statement, 0, last_written_block);
           future = cass_session_execute(session, statement);
           check_future(future, "deleting forked receipts");
+          cass_future_free(future);
+          cass_statement_free(statement);
 
           statement = cass_prepared_bind(prepared_del_actions);
           cass_statement_bind_int64(statement, 0, last_written_block);
           future = cass_session_execute(session, statement);
           check_future(future, "deleting forked actions");
+          cass_future_free(future);
+          cass_statement_free(statement);
 
           statement = cass_prepared_bind(prepared_del_abi_history);
           cass_statement_bind_int64(statement, 0, last_written_block);
           future = cass_session_execute(session, statement);
           check_future(future, "deleting forked abi_history");
+          cass_future_free(future);
+          cass_statement_free(statement);
 
           last_written_block--;
         }
@@ -402,14 +417,16 @@ public:
     uint64_t block_timestamp = bb->block_timestamp.to_time_point().elapsed.count() / 1000;
     uint64_t block_date = block_timestamp - (block_timestamp % MILLISECONDS_IN_A_DAY);
 
-    auto tracker = make_shared<req_queue_entry>();
-    tracker->block_num = bb->block_num;
-    tracker->block_timestamp = block_timestamp;
-    tracker->block_date = block_date;
-    tracker->db_req_counter = 1;
+    auto tracker_ptr = make_shared<req_queue_entry>();
+    tracker_ptr->block_num = bb->block_num;
+    tracker_ptr->block_timestamp = block_timestamp;
+    tracker_ptr->block_date = block_date;
+    tracker_ptr->db_req_counter = 1;
+
+    req_queue_entry* tracker = tracker_ptr.get();
     
     queue_mtx.lock();
-    request_queue.push(tracker); 
+    request_queue.push(std::move(tracker_ptr));
     queue_mtx.unlock();
 
     CassStatement* statement = cass_prepared_bind(prepared_ins_pointers);
@@ -418,12 +435,12 @@ public:
     cass_statement_bind_int64(statement, pos++, bb->block_num); // id=0: last written block
 
     CassFuture* future = cass_session_execute(session, statement);
-    cass_future_set_callback(future, scylla_result_callback, &tracker);
+    cass_future_set_callback(future, scylla_result_callback, tracker);
     cass_future_free(future);
     cass_statement_free(statement);
   }
 
-  
+
   struct trace_job {
     std::shared_ptr<req_queue_entry>          tracker;
     uint64_t                                  global_seq = 0;
@@ -437,7 +454,8 @@ public:
 
   void on_transaction_trace(std::shared_ptr<chronicle::channels::transaction_trace> ccttr) {
     queue_mtx.lock();
-    auto& tracker = request_queue.back();
+    auto& tracker_ptr = request_queue.back();
+    req_queue_entry* tracker = tracker_ptr.get();
 
     if( tracker->block_num != ccttr->block_num ) {
       elog("Trace block: ${b}, tracker: ${t}", ("b", ccttr->block_num)("t",tracker->block_num));
@@ -449,8 +467,8 @@ public:
     queue_mtx.unlock();
 
     auto job = make_shared<trace_job>();
-    job->tracker = tracker;
-    
+    job->tracker = tracker_ptr;
+
     auto& trace = std::get<eosio::ship_protocol::transaction_trace_v0>(ccttr->trace);
 
     for( auto atrace = trace.action_traces.begin();
@@ -499,7 +517,7 @@ public:
         job->actions_seen[contract.value].insert(act->name.value);
       }
     }
-    
+
     if( job->global_seq == 0 ) {
       throw std::runtime_error("global_seq is zero");
     }
@@ -507,7 +525,8 @@ public:
     job->trx_id = trace.id.extract_as_byte_array();
     job->raw_trace.assign(ccttr->bin_start, ccttr->bin_start + ccttr->bin_size);
 
-    traces_io_service.post(boost::bind(&exp_chronos_plugin_impl::process_transaction_trace, this, job));
+    ilog("PO block: ${b} seq: ${s}", ("b",tracker->block_num)("s",job->global_seq));
+    traces_io_context.post(boost::bind(&exp_chronos_plugin_impl::process_transaction_trace, this, job));
   }
 
 
@@ -522,6 +541,8 @@ public:
     uint64_t block_timestamp = tracker->block_timestamp;
     uint64_t block_date = tracker->block_date;
     uint64_t global_seq = job->global_seq;
+
+    ilog("EX block: ${b} seq: ${s}", ("b", block_num)("s",global_seq));
     
     {
       CassStatement* statement = cass_prepared_bind(prepared_ins_transactions);
@@ -678,8 +699,8 @@ public:
 
 
   void on_block_completed(std::shared_ptr<block_finished> bf) {
-    auto& tracker = request_queue.back();
-    
+    req_queue_entry* tracker = request_queue.back().get();
+
     if( is_bootstrapping ) {
       CassStatement* statement = cass_prepared_bind(prepared_ins_pointers);
       size_t pos = 0;
@@ -691,7 +712,7 @@ public:
       queue_mtx.unlock();
 
       CassFuture* future = cass_session_execute(session, statement);
-      cass_future_set_callback(future, scylla_result_callback, &tracker);
+      cass_future_set_callback(future, scylla_result_callback, tracker);
       cass_future_free(future);
       cass_statement_free(statement);
 
@@ -709,7 +730,7 @@ public:
       queue_mtx.unlock();
 
       CassFuture* future = cass_session_execute(session, statement);
-      cass_future_set_callback(future, scylla_result_callback, &tracker);
+      cass_future_set_callback(future, scylla_result_callback, tracker);
       cass_future_free(future);
       cass_statement_free(statement);
 
@@ -727,11 +748,11 @@ public:
     queue_mtx.lock();
     {
       auto& tracker = request_queue.front();
-      ilog("trace_jobs_counter = ${t}  db_req_counter = ${d} total_trx = ${x}",
-           ("t",tracker->trace_jobs_counter)("d",tracker->db_req_counter)("x",tracker->total_trx));
+      ilog("block=${b} trace_jobs_counter = ${t}  db_req_counter = ${d} total_trx = ${x}",
+           ("b",tracker->block_num)("t",tracker->trace_jobs_counter)("d",tracker->db_req_counter)("x",tracker->total_trx));
     }
     while( !request_queue.empty() && request_queue.front()->is_finished() ) {
-      auto& tracker = request_queue.front();
+      req_queue_entry* tracker = request_queue.front().get();
       ack = tracker->block_num;
       trx_counter += tracker->total_trx;
       if( date_max < tracker->block_date ) {
