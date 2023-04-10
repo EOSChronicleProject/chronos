@@ -39,7 +39,7 @@ namespace {
 
 // scylla client threads may exit after main thread, so we we need to organize a clean aborting
 
-static boost::mutex queue_mtx;
+static std::mutex track_mtx;
 static bool is_exiting = false;
 
 void atexit_handler()
@@ -48,7 +48,7 @@ void atexit_handler()
 }
 
 // tracker for ScyllaDB asynchronous requests
-struct req_queue_entry {
+struct block_track_entry {
   uint32_t block_num;
   uint64_t block_timestamp;
   uint64_t block_date;
@@ -72,24 +72,32 @@ void scylla_result_callback(CassFuture* future, void* data)
       abort_receiver();
     }
 
-    queue_mtx.lock();
-    ((req_queue_entry*)data)->db_req_counter--;
-    queue_mtx.unlock();
+    std::unique_lock<std::mutex> lock(track_mtx);
+    ((block_track_entry*)data)->db_req_counter--;
   }
 }
+
+struct trace_job {
+  std::shared_ptr<block_track_entry>        tracker;
+  uint64_t                                  global_seq = 0;
+  std::map<uint64_t, uint64_t>              recv_seq_start;
+  std::map<uint64_t, uint64_t>              recv_seq_max;
+  std::map<uint64_t, std::set<uint64_t>>    actions_seen;
+  std::array<uint8_t,32>                    trx_id;
+  std::vector<uint8_t>                      raw_trace;
+};
+
+
 
 
 class exp_chronos_plugin_impl : std::enable_shared_from_this<exp_chronos_plugin_impl> {
 public:
   exp_chronos_plugin_impl():
-    traces_io_context(),
-    traces_worker(boost::asio::make_work_guard(traces_io_context)),
     fork_pause_timer(app().get_io_service())
   {}
 
   ~exp_chronos_plugin_impl() {
-    traces_worker.reset();
-    traces_thread_group.join_all();
+    // stop();
   }
 
 
@@ -130,11 +138,13 @@ public:
 
   const int channel_priority = 55;
 
-  std::queue<std::shared_ptr<req_queue_entry>>        request_queue;
-  boost::asio::io_context            traces_io_context;
-  boost::asio::executor_work_guard<boost::asio::io_context::executor_type> traces_worker;
-  size_t trace_treads = 1;
+  std::queue<std::shared_ptr<block_track_entry>>        block_track_queue;
+
+  size_t                             trace_treads = 4;
   boost::thread_group                traces_thread_group;
+  std::mutex                         traces_queue_mutex;
+  std::condition_variable            traces_queue_condition;
+  std::queue<std::shared_ptr<trace_job>> traces_queue;
 
   boost::asio::deadline_timer        fork_pause_timer;
 
@@ -145,7 +155,7 @@ public:
   boost::posix_time::ptime counter_start_time;
 
   // map keys are block dates currently in the processing queue
-  boost::mutex date_maps_mtx;
+  std::mutex date_maps_mtx;
   std::map<uint64_t, std::set<uint64_t>>                     receipt_date_written;
   std::map<uint64_t, std::map<uint64_t, std::set<uint64_t>>> action_date_written;
 
@@ -199,9 +209,9 @@ public:
     session = cass_session_new();
     cass_cluster_set_contact_points(cluster, scylla_hosts.c_str());
     cass_cluster_set_local_port_range(cluster, 49152, 65535);
-    cass_cluster_set_core_connections_per_host(cluster, scylla_conn_per_host);
+    // cass_cluster_set_core_connections_per_host(cluster, scylla_conn_per_host);
     cass_cluster_set_request_timeout(cluster, 0);
-    cass_cluster_set_num_threads_io(cluster, 4);
+    // cass_cluster_set_num_threads_io(cluster, 4);
     cass_cluster_set_queue_size_io(cluster, 81920);
     if( scylla_username.size() > 0 ) {
       cass_cluster_set_credentials(cluster, scylla_username.c_str(), scylla_password.c_str());
@@ -323,11 +333,18 @@ public:
     }
 
     for(size_t i=0; i < trace_treads; ++i) {
-      traces_thread_group.create_thread(boost::bind(&boost::asio::io_context::run, &traces_io_context));
+      traces_thread_group.create_thread(boost::bind(&exp_chronos_plugin_impl::traces_job_thread, this));
     }
 
     counter_start_time = boost::posix_time::microsec_clock::local_time();
   }
+
+  void stop() {
+    is_exiting = true;
+    traces_queue_condition.notify_all();
+    traces_thread_group.join_all();
+  }
+
 
   void check_future(CassFuture* future, const string what) {
     if (cass_future_error_code(future) != CASS_OK) {
@@ -341,13 +358,14 @@ public:
   }
 
   void on_fork(std::shared_ptr<chronicle::channels::fork_event> fe) {
-    queue_mtx.lock();
-    while( !request_queue.empty() && request_queue.front()->is_finished() ) {
-      request_queue.pop();
+    {
+      std::unique_lock<std::mutex> lock(track_mtx);
+      while( !block_track_queue.empty() && block_track_queue.front()->is_finished() ) {
+        block_track_queue.pop();
+      }
     }
-    queue_mtx.unlock();
 
-    size_t queue_size = request_queue.size();
+    size_t queue_size = block_track_queue.size();
     if( queue_size > 0 ) {
       ilog("ScyllaDB queue size is ${s}. Pausing the fork handling", ("s", queue_size));
       fork_pause_timer.expires_from_now(boost::posix_time::milliseconds(200));
@@ -417,17 +435,18 @@ public:
     uint64_t block_timestamp = bb->block_timestamp.to_time_point().elapsed.count() / 1000;
     uint64_t block_date = block_timestamp - (block_timestamp % MILLISECONDS_IN_A_DAY);
 
-    auto tracker_ptr = make_shared<req_queue_entry>();
+    auto tracker_ptr = make_shared<block_track_entry>();
     tracker_ptr->block_num = bb->block_num;
     tracker_ptr->block_timestamp = block_timestamp;
     tracker_ptr->block_date = block_date;
     tracker_ptr->db_req_counter = 1;
 
-    req_queue_entry* tracker = tracker_ptr.get();
-    
-    queue_mtx.lock();
-    request_queue.push(std::move(tracker_ptr));
-    queue_mtx.unlock();
+    block_track_entry* tracker = tracker_ptr.get();
+
+    {
+      std::unique_lock<std::mutex> lock(track_mtx);
+      block_track_queue.push(std::move(tracker_ptr));
+    }
 
     CassStatement* statement = cass_prepared_bind(prepared_ins_pointers);
     size_t pos = 0;
@@ -441,47 +460,37 @@ public:
   }
 
 
-  struct trace_job {
-    std::shared_ptr<req_queue_entry>          tracker;
-    uint64_t                                  global_seq = 0;
-    std::map<uint64_t, uint64_t>              recv_seq_start;
-    std::map<uint64_t, uint64_t>              recv_seq_max;
-    std::map<uint64_t, std::set<uint64_t>>    actions_seen;
-    std::array<uint8_t,32>                    trx_id;
-    std::vector<uint8_t>                      raw_trace;
-  };
-
-
   void on_transaction_trace(std::shared_ptr<chronicle::channels::transaction_trace> ccttr) {
-    queue_mtx.lock();
-    auto& tracker_ptr = request_queue.back();
-    req_queue_entry* tracker = tracker_ptr.get();
+    std::shared_ptr<block_track_entry> tracker_ptr;
+    block_track_entry* tracker;
+    {
+      std::unique_lock<std::mutex> lock(track_mtx);
+      tracker_ptr = block_track_queue.back();
+      tracker = tracker_ptr.get();
 
-    if( tracker->block_num != ccttr->block_num ) {
-      elog("Trace block: ${b}, tracker: ${t}", ("b", ccttr->block_num)("t",tracker->block_num));
-      throw std::runtime_error("tracker block is not the same as trace block");
+      if( tracker->block_num != ccttr->block_num ) {
+        elog("Trace block: ${b}, tracker: ${t}", ("b", ccttr->block_num)("t",tracker->block_num));
+        throw std::runtime_error("tracker block is not the same as trace block");
+      }
+
+      tracker->trace_jobs_counter++;
+      tracker->total_trx++;
     }
-
-    tracker->trace_jobs_counter++;
-    tracker->total_trx++;
-    queue_mtx.unlock();
 
     auto job = make_shared<trace_job>();
     job->tracker = tracker_ptr;
 
     auto& trace = std::get<eosio::ship_protocol::transaction_trace_v0>(ccttr->trace);
 
-    for( auto atrace = trace.action_traces.begin();
-         atrace != trace.action_traces.end();
-         ++atrace ) {
+    for( auto& atrace: trace.action_traces ) {
 
       eosio::ship_protocol::action*               act;
       eosio::ship_protocol::action_receipt_v0*    receipt;
       eosio::name                                 receiver;
 
-      size_t index = atrace->index();
+      size_t index = atrace.index();
       if( index == 0 ) {
-        eosio::ship_protocol::action_trace_v0& at = std::get<eosio::ship_protocol::action_trace_v0>(*atrace);
+        eosio::ship_protocol::action_trace_v0& at = std::get<eosio::ship_protocol::action_trace_v0>(atrace);
         if( ! at.receipt ) {
           break;
         }
@@ -490,7 +499,7 @@ public:
         receiver = at.receiver;
       }
       else if( index == 1 ) {
-        eosio::ship_protocol::action_trace_v1& at = std::get<eosio::ship_protocol::action_trace_v1>(*atrace);
+        eosio::ship_protocol::action_trace_v1& at = std::get<eosio::ship_protocol::action_trace_v1>(atrace);
         if( ! at.receipt ) {
           break;
         }
@@ -506,8 +515,9 @@ public:
         job->global_seq = receipt->global_sequence;
       }
 
+
       if( job->recv_seq_start.count(receiver.value) == 0 ) {
-        job->recv_seq_start.emplace(receiver.value, receipt->recv_sequence);
+        job->recv_seq_start.insert_or_assign(receiver.value, receipt->recv_sequence);
       }
 
       job->recv_seq_max.insert_or_assign(receiver.value, receipt->recv_sequence);
@@ -525,8 +535,33 @@ public:
     job->trx_id = trace.id.extract_as_byte_array();
     job->raw_trace.assign(ccttr->bin_start, ccttr->bin_start + ccttr->bin_size);
 
-    ilog("PO block: ${b} seq: ${s}", ("b",tracker->block_num)("s",job->global_seq));
-    traces_io_context.post(boost::bind(&exp_chronos_plugin_impl::process_transaction_trace, this, job));
+    {
+      std::unique_lock<std::mutex> lock(traces_queue_mutex);
+      traces_queue.push(job);
+    }
+    traces_queue_condition.notify_one();
+  }
+
+
+  void traces_job_thread()
+  {
+    while (true) {
+      std::shared_ptr<trace_job> job;
+      {
+        if(is_exiting) {
+          return;
+        }
+
+        std::unique_lock<std::mutex> lock(traces_queue_mutex);
+        traces_queue_condition.wait(lock, [this] {
+          return !traces_queue.empty() || is_exiting;
+        });
+
+        job = traces_queue.front();
+        traces_queue.pop();
+      }
+      process_transaction_trace(job);
+    }
   }
 
 
@@ -536,14 +571,14 @@ public:
       return;
     }
 
-    req_queue_entry* tracker = job->tracker.get();
+    block_track_entry* tracker = job->tracker.get();
     uint32_t block_num = tracker->block_num;
     uint64_t block_timestamp = tracker->block_timestamp;
     uint64_t block_date = tracker->block_date;
     uint64_t global_seq = job->global_seq;
 
-    ilog("EX block: ${b} seq: ${s}", ("b", block_num)("s",global_seq));
-    
+    // ilog("EX block: ${b} seq: ${s}", ("b", block_num)("s",global_seq));
+
     {
       CassStatement* statement = cass_prepared_bind(prepared_ins_transactions);
       size_t pos = 0;
@@ -553,9 +588,10 @@ public:
       cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)job->trx_id.data(), job->trx_id.size());
       cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)job->raw_trace.data(), job->raw_trace.size());
 
-      queue_mtx.lock();
-      tracker->db_req_counter++;
-      queue_mtx.unlock();
+      {
+        std::unique_lock<std::mutex> lock(track_mtx);
+        tracker->db_req_counter++;
+      }
 
       CassFuture* future = cass_session_execute(session, statement);
       cass_future_set_callback(future, scylla_result_callback, tracker);
@@ -575,9 +611,10 @@ public:
         cass_statement_bind_int64(statement, pos++, item.second);
         cass_statement_bind_int64(statement, pos++, job->recv_seq_max.at(item.first) - item.second + 1);
 
-        queue_mtx.lock();
-        tracker->db_req_counter++;
-        queue_mtx.unlock();
+        {
+          std::unique_lock<std::mutex> lock(track_mtx);
+          tracker->db_req_counter++;
+        }
 
         CassFuture* future = cass_session_execute(session, statement);
         cass_future_set_callback(future, scylla_result_callback, tracker);
@@ -585,28 +622,25 @@ public:
         cass_statement_free(statement);
       }
 
-      date_maps_mtx.lock();
+      std::unique_lock<std::mutex> lock(date_maps_mtx);
       if( receipt_date_written[block_date].count(item.first) == 0 )
       {
         receipt_date_written[block_date].insert(item.first);
-        date_maps_mtx.unlock();
 
         CassStatement* statement = cass_prepared_bind(prepared_ins_receipt_dates);
         size_t pos = 0;
         cass_statement_bind_string(statement, pos++, eosio::name_to_string(item.first).c_str());
         cass_statement_bind_int64(statement, pos++, block_date);
 
-        queue_mtx.lock();
-        tracker->db_req_counter++;
-        queue_mtx.unlock();
+        {
+          std::unique_lock<std::mutex> lock(track_mtx);
+          tracker->db_req_counter++;
+        }
 
         CassFuture* future = cass_session_execute(session, statement);
         cass_future_set_callback(future, scylla_result_callback, tracker);
         cass_future_free(future);
         cass_statement_free(statement);
-      }
-      else {
-        date_maps_mtx.unlock();
       }
     }
 
@@ -622,9 +656,10 @@ public:
           cass_statement_bind_string(statement, pos++, eosio::name_to_string(item.first).c_str());
           cass_statement_bind_string(statement, pos++, eosio::name_to_string(aname).c_str());
 
-          queue_mtx.lock();
-          tracker->db_req_counter++;
-          queue_mtx.unlock();
+          {
+            std::unique_lock<std::mutex> lock(track_mtx);
+            tracker->db_req_counter++;
+          }
 
           CassFuture* future = cass_session_execute(session, statement);
           cass_future_set_callback(future, scylla_result_callback, tracker);
@@ -632,11 +667,10 @@ public:
           cass_statement_free(statement);
         }
 
-        date_maps_mtx.lock();
+        std::unique_lock<std::mutex> lock(date_maps_mtx);
         if( action_date_written[block_date][item.first].count(aname) == 0 )
         {
           action_date_written[block_date][item.first].insert(aname);
-          date_maps_mtx.unlock();
 
           CassStatement* statement = cass_prepared_bind(prepared_ins_action_dates);
           size_t pos = 0;
@@ -644,24 +678,21 @@ public:
           cass_statement_bind_string(statement, pos++, eosio::name_to_string(aname).c_str());
           cass_statement_bind_int64(statement, pos++, block_date);
 
-          queue_mtx.lock();
-          tracker->db_req_counter++;
-          queue_mtx.unlock();
+          {
+            std::unique_lock<std::mutex> lock(track_mtx);
+            tracker->db_req_counter++;
+          }
 
           CassFuture* future = cass_session_execute(session, statement);
           cass_future_set_callback(future, scylla_result_callback, tracker);
           cass_future_free(future);
           cass_statement_free(statement);
         }
-        else {
-          date_maps_mtx.unlock();
-        }
       }
     }
 
-    queue_mtx.lock();
+    std::unique_lock<std::mutex> lock(track_mtx);
     tracker->trace_jobs_counter--;
-    queue_mtx.unlock();
   }
 
 
@@ -699,7 +730,11 @@ public:
 
 
   void on_block_completed(std::shared_ptr<block_finished> bf) {
-    req_queue_entry* tracker = request_queue.back().get();
+    if( block_track_queue.empty() ) {
+      throw std::runtime_error("block_track_queue is empty in on_block_completed");
+    }
+
+    block_track_entry* tracker = block_track_queue.back().get();
 
     if( is_bootstrapping ) {
       CassStatement* statement = cass_prepared_bind(prepared_ins_pointers);
@@ -707,9 +742,10 @@ public:
       cass_statement_bind_int32(statement, pos++, 2); // id=2: lowest block in history
       cass_statement_bind_int64(statement, pos++, bf->block_num);
 
-      queue_mtx.lock();
-      tracker->db_req_counter++;
-      queue_mtx.unlock();
+      {
+        std::unique_lock<std::mutex> lock(track_mtx);
+        tracker->db_req_counter++;
+      }
 
       CassFuture* future = cass_session_execute(session, statement);
       cass_future_set_callback(future, scylla_result_callback, tracker);
@@ -725,9 +761,10 @@ public:
       cass_statement_bind_int32(statement, pos++, 1); // id=1: irreversible block,
       cass_statement_bind_int64(statement, pos++, bf->block_num);
 
-      queue_mtx.lock();
-      tracker->db_req_counter++;
-      queue_mtx.unlock();
+      {
+        std::unique_lock<std::mutex> lock(track_mtx);
+        tracker->db_req_counter++;
+      }
 
       CassFuture* future = cass_session_execute(session, statement);
       cass_future_set_callback(future, scylla_result_callback, tracker);
@@ -745,36 +782,43 @@ public:
   void ack_finished_blocks() {
     uint32_t ack = 0;
     uint64_t date_max = 0;
-    queue_mtx.lock();
+
     {
-      auto& tracker = request_queue.front();
-      ilog("block=${b} trace_jobs_counter = ${t}  db_req_counter = ${d} total_trx = ${x}",
-           ("b",tracker->block_num)("t",tracker->trace_jobs_counter)("d",tracker->db_req_counter)("x",tracker->total_trx));
-    }
-    while( !request_queue.empty() && request_queue.front()->is_finished() ) {
-      req_queue_entry* tracker = request_queue.front().get();
-      ack = tracker->block_num;
-      trx_counter += tracker->total_trx;
-      if( date_max < tracker->block_date ) {
-        date_max = tracker->block_date;
+      std::unique_lock<std::mutex> lock(track_mtx);
+
+      if( !block_track_queue.empty() )
+      {
+        auto& tracker_ptr = block_track_queue.front();
+        ilog("block=${b} trace_jobs_counter = ${t}  db_req_counter = ${d} total_trx = ${x}",
+             ("b",tracker_ptr->block_num)("t",tracker_ptr->trace_jobs_counter)
+             ("d",tracker_ptr->db_req_counter)("x",tracker_ptr->total_trx));
       }
-      request_queue.pop();
-      block_counter++;
+
+      while( !block_track_queue.empty() && block_track_queue.front()->is_finished() ) {
+        block_track_entry* tracker = block_track_queue.front().get();
+        ack = tracker->block_num;
+        trx_counter += tracker->total_trx;
+        if( date_max < tracker->block_date ) {
+          date_max = tracker->block_date;
+        }
+        block_track_queue.pop();
+        block_counter++;
+      }
     }
-    queue_mtx.unlock();
 
     // clean up old entries in the maps
-    date_maps_mtx.lock();
-    auto recepts_iter = receipt_date_written.begin();
-    while( recepts_iter->first < date_max ) {
-      recepts_iter = receipt_date_written.erase(recepts_iter);
-    }
+    {
+      std::unique_lock<std::mutex> lock(date_maps_mtx);
+      auto recepts_iter = receipt_date_written.begin();
+      while( recepts_iter->first < date_max ) {
+        recepts_iter = receipt_date_written.erase(recepts_iter);
+      }
 
-    auto actions_iter = action_date_written.begin();
-    while( actions_iter->first < date_max ) {
-      actions_iter = action_date_written.erase(actions_iter);
+      auto actions_iter = action_date_written.begin();
+      while( actions_iter->first < date_max ) {
+        actions_iter = action_date_written.erase(actions_iter);
+      }
     }
-    date_maps_mtx.unlock();
 
     if( ack > 0 ) {
       ack_block(ack);
@@ -872,6 +916,7 @@ void exp_chronos_plugin::plugin_startup(){
 }
 
 void exp_chronos_plugin::plugin_shutdown() {
+  my->stop();
   if (!is_noexport_mode()) {
     ilog("exp_chronos_plugin stopped");
   }
