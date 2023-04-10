@@ -209,9 +209,9 @@ public:
     session = cass_session_new();
     cass_cluster_set_contact_points(cluster, scylla_hosts.c_str());
     cass_cluster_set_local_port_range(cluster, 49152, 65535);
-    // cass_cluster_set_core_connections_per_host(cluster, scylla_conn_per_host);
+    cass_cluster_set_core_connections_per_host(cluster, scylla_conn_per_host);
     cass_cluster_set_request_timeout(cluster, 0);
-    // cass_cluster_set_num_threads_io(cluster, 4);
+    cass_cluster_set_num_threads_io(cluster, 4);
     cass_cluster_set_queue_size_io(cluster, 81920);
     if( scylla_username.size() > 0 ) {
       cass_cluster_set_credentials(cluster, scylla_username.c_str(), scylla_password.c_str());
@@ -445,7 +445,7 @@ public:
 
     {
       std::unique_lock<std::mutex> lock(track_mtx);
-      block_track_queue.push(std::move(tracker_ptr));
+      block_track_queue.push(tracker_ptr);
     }
 
     CassStatement* statement = cass_prepared_bind(prepared_ins_pointers);
@@ -535,6 +535,8 @@ public:
     job->trx_id = trace.id.extract_as_byte_array();
     job->raw_trace.assign(ccttr->bin_start, ccttr->bin_start + ccttr->bin_size);
 
+    ilog("IN  block: ${b} seq: ${s}", ("b",tracker->block_num)("s",job->global_seq));
+
     {
       std::unique_lock<std::mutex> lock(traces_queue_mutex);
       traces_queue.push(job);
@@ -572,12 +574,19 @@ public:
     }
 
     block_track_entry* tracker = job->tracker.get();
+
     uint32_t block_num = tracker->block_num;
     uint64_t block_timestamp = tracker->block_timestamp;
     uint64_t block_date = tracker->block_date;
     uint64_t global_seq = job->global_seq;
 
-    // ilog("EX block: ${b} seq: ${s}", ("b", block_num)("s",global_seq));
+    ilog("OUT block: ${b} seq: ${s}", ("b", block_num)("s",global_seq));
+
+    {
+      std::unique_lock<std::mutex> lock(track_mtx);
+      tracker->trace_jobs_counter--;
+      return;
+    }
 
     {
       CassStatement* statement = cass_prepared_bind(prepared_ins_transactions);
