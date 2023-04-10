@@ -58,7 +58,7 @@ struct block_track_entry {
   uint32_t total_trx = 0;
   bool     block_complete = false;
 
-  inline bool is_finished() const {return (block_complete && trace_jobs_counter == 0 && db_req_counter == 0);}
+  inline bool is_finished() const {return (block_complete && (trace_jobs_counter + db_req_counter == 0));}
 };
 
 
@@ -473,18 +473,16 @@ public:
       return;
     }
 
-    std::shared_ptr<block_track_entry> tracker_ptr;
-    block_track_entry* tracker;
+    std::shared_ptr<block_track_entry>& tracker_ptr = block_track_queue.back();
+    block_track_entry* tracker = tracker_ptr.get();
+
+    if( tracker->block_num != ccttr->block_num ) {
+      elog("Trace block: ${b}, tracker: ${t}", ("b", ccttr->block_num)("t",tracker->block_num));
+      throw std::runtime_error("tracker block is not the same as trace block");
+    }
+
     {
       std::unique_lock<std::mutex> lock(track_jobs_counter_mtx);
-      tracker_ptr = block_track_queue.back();
-      tracker = tracker_ptr.get();
-
-      if( tracker->block_num != ccttr->block_num ) {
-        elog("Trace block: ${b}, tracker: ${t}", ("b", ccttr->block_num)("t",tracker->block_num));
-        throw std::runtime_error("tracker block is not the same as trace block");
-      }
-
       tracker->trace_jobs_counter++;
       tracker->total_trx++;
     }
@@ -526,7 +524,6 @@ public:
         job_entry->global_seq = receipt->global_sequence;
       }
 
-
       if( job_entry->recv_seq_start.count(receiver.value) == 0 ) {
         job_entry->recv_seq_start.insert_or_assign(receiver.value, receipt->recv_sequence);
       }
@@ -560,9 +557,9 @@ public:
       std::shared_ptr<trace_job> job;
       {
         std::unique_lock<std::mutex> lock(traces_queue_mutex);
-        traces_queue_condition.wait(lock, [this] {
-          return !traces_queue.empty() || is_exiting;
-        });
+        while( traces_queue.empty() && !is_exiting ) {
+          traces_queue_condition.wait(lock);
+        }
 
         if(is_exiting) {
           return;
@@ -808,20 +805,6 @@ public:
     }
 
     if( ack > 0 ) {
-      // clean up old entries in the maps
-      {
-        std::unique_lock<std::mutex> lock(date_maps_mtx);
-        auto recepts_iter = receipt_date_written.begin();
-        while( recepts_iter->first < date_max ) {
-          recepts_iter = receipt_date_written.erase(recepts_iter);
-        }
-
-        auto actions_iter = action_date_written.begin();
-        while( actions_iter->first < date_max ) {
-          actions_iter = action_date_written.erase(actions_iter);
-        }
-      }
-
       ack_block(ack);
 
       if( block_counter >= 200 ) {
@@ -836,6 +819,20 @@ public:
           counter_start_time = now;
           block_counter = 0;
           trx_counter = 0;
+        }
+
+        // clean up old entries in the maps
+        {
+          std::unique_lock<std::mutex> lock(date_maps_mtx);
+          auto recepts_iter = receipt_date_written.begin();
+          while( recepts_iter->first < date_max ) {
+            recepts_iter = receipt_date_written.erase(recepts_iter);
+          }
+
+          auto actions_iter = action_date_written.begin();
+          while( actions_iter->first < date_max ) {
+            actions_iter = action_date_written.erase(actions_iter);
+          }
         }
       }
     }
