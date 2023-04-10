@@ -101,6 +101,7 @@ struct trace_job {
 class exp_chronos_plugin_impl : std::enable_shared_from_this<exp_chronos_plugin_impl> {
 public:
   exp_chronos_plugin_impl():
+    traces_worker(boost::asio::make_work_guard(traces_io_context)),
     fork_pause_timer(app().get_io_service())
   {}
 
@@ -149,9 +150,8 @@ public:
 
   size_t                             trace_treads = 4;
   boost::thread_group                traces_thread_group;
-  std::mutex                         traces_queue_mutex;
-  std::condition_variable            traces_queue_condition;
-  std::queue<std::shared_ptr<trace_job>> traces_queue;
+  boost::asio::io_context            traces_io_context;
+  boost::asio::executor_work_guard<boost::asio::io_context::executor_type> traces_worker;
 
   boost::asio::deadline_timer        fork_pause_timer;
 
@@ -340,7 +340,7 @@ public:
     }
 
     for(size_t i=0; i < trace_treads; ++i) {
-      traces_thread_group.create_thread(boost::bind(&exp_chronos_plugin_impl::traces_job_thread, this));
+      traces_thread_group.create_thread(boost::bind(&boost::asio::io_context::run, &traces_io_context));
     }
 
     counter_start_time = boost::posix_time::microsec_clock::local_time();
@@ -348,8 +348,8 @@ public:
 
   void stop() {
     is_exiting = true;
-    traces_queue_condition.notify_all();
     traces_thread_group.join_all();
+
     CassFuture* future = cass_session_close(session);
     check_future(future, "closing the session");
     ilog("Disconnected from ScyllaDB cluster");
@@ -543,33 +543,7 @@ public:
     job_entry->trx_id = trace.id.extract_as_byte_array();
     job_entry->raw_trace.assign(ccttr->bin_start, ccttr->bin_start + ccttr->bin_size);
 
-    {
-      std::unique_lock<std::mutex> lock(traces_queue_mutex);
-      traces_queue.push(job);
-    }
-    traces_queue_condition.notify_one();
-  }
-
-
-  void traces_job_thread()
-  {
-    while (true) {
-      std::shared_ptr<trace_job> job;
-      {
-        std::unique_lock<std::mutex> lock(traces_queue_mutex);
-        while( traces_queue.empty() && !is_exiting ) {
-          traces_queue_condition.wait(lock);
-        }
-
-        if(is_exiting) {
-          return;
-        }
-
-        job = traces_queue.front();
-        traces_queue.pop();
-      }
-      process_transaction_trace(job);
-    }
+    traces_io_context.post(boost::bind(&exp_chronos_plugin_impl::process_transaction_trace, this, job));
   }
 
 
