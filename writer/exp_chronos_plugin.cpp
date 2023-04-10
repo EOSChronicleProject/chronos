@@ -73,7 +73,13 @@ void scylla_result_callback(CassFuture* future, void* data)
     }
 
     std::unique_lock<std::mutex> lock(track_mtx);
-    ((block_track_entry*)data)->db_req_counter--;
+    block_track_entry* tracker = (block_track_entry*)data;
+
+    if( tracker->db_req_counter == 0 ) {
+      elog("tracker underflow, block= ${b}", ("b",tracker->block_num));
+      abort_receiver();
+    }
+    tracker->db_req_counter--;
   }
 }
 
@@ -97,7 +103,6 @@ public:
   {}
 
   ~exp_chronos_plugin_impl() {
-    // stop();
   }
 
 
@@ -343,6 +348,10 @@ public:
     is_exiting = true;
     traces_queue_condition.notify_all();
     traces_thread_group.join_all();
+    CassFuture* future = cass_session_close(session);
+    check_future(future, "closing the session");
+    ilog("Disconnected from ScyllaDB cluster");
+    cass_future_free(future);
   }
 
 
@@ -461,6 +470,11 @@ public:
 
 
   void on_transaction_trace(std::shared_ptr<chronicle::channels::transaction_trace> ccttr) {
+    auto& trace = std::get<eosio::ship_protocol::transaction_trace_v0>(ccttr->trace);
+    if( trace.status != eosio::ship_protocol::transaction_status::executed ) {
+      return;
+    }
+
     std::shared_ptr<block_track_entry> tracker_ptr;
     block_track_entry* tracker;
     {
@@ -479,8 +493,6 @@ public:
 
     auto job = make_shared<trace_job>();
     job->tracker = tracker_ptr;
-
-    auto& trace = std::get<eosio::ship_protocol::transaction_trace_v0>(ccttr->trace);
 
     for( auto& atrace: trace.action_traces ) {
 
@@ -535,8 +547,6 @@ public:
     job->trx_id = trace.id.extract_as_byte_array();
     job->raw_trace.assign(ccttr->bin_start, ccttr->bin_start + ccttr->bin_size);
 
-    ilog("IN  block: ${b} seq: ${s}", ("b",tracker->block_num)("s",job->global_seq));
-
     {
       std::unique_lock<std::mutex> lock(traces_queue_mutex);
       traces_queue.push(job);
@@ -550,14 +560,14 @@ public:
     while (true) {
       std::shared_ptr<trace_job> job;
       {
-        if(is_exiting) {
-          return;
-        }
-
         std::unique_lock<std::mutex> lock(traces_queue_mutex);
         traces_queue_condition.wait(lock, [this] {
           return !traces_queue.empty() || is_exiting;
         });
+
+        if(is_exiting) {
+          return;
+        }
 
         job = traces_queue.front();
         traces_queue.pop();
@@ -579,14 +589,6 @@ public:
     uint64_t block_timestamp = tracker->block_timestamp;
     uint64_t block_date = tracker->block_date;
     uint64_t global_seq = job->global_seq;
-
-    ilog("OUT block: ${b} seq: ${s}", ("b", block_num)("s",global_seq));
-
-    {
-      std::unique_lock<std::mutex> lock(track_mtx);
-      tracker->trace_jobs_counter--;
-      return;
-    }
 
     {
       CassStatement* statement = cass_prepared_bind(prepared_ins_transactions);
@@ -796,13 +798,6 @@ public:
       std::unique_lock<std::mutex> lock(track_mtx);
 
       if( !block_track_queue.empty() )
-      {
-        auto& tracker_ptr = block_track_queue.front();
-        ilog("block=${b} trace_jobs_counter = ${t}  db_req_counter = ${d} total_trx = ${x}",
-             ("b",tracker_ptr->block_num)("t",tracker_ptr->trace_jobs_counter)
-             ("d",tracker_ptr->db_req_counter)("x",tracker_ptr->total_trx));
-      }
-
       while( !block_track_queue.empty() && block_track_queue.front()->is_finished() ) {
         block_track_entry* tracker = block_track_queue.front().get();
         ack = tracker->block_num;
@@ -831,7 +826,6 @@ public:
 
     if( ack > 0 ) {
       ack_block(ack);
-      ilog("a ${a}", ("a", ack));
 
       if( block_counter >= 200 ) {
         boost::posix_time::ptime now = boost::posix_time::microsec_clock::local_time();
@@ -925,8 +919,8 @@ void exp_chronos_plugin::plugin_startup(){
 }
 
 void exp_chronos_plugin::plugin_shutdown() {
-  my->stop();
   if (!is_noexport_mode()) {
+    my->stop();
     ilog("exp_chronos_plugin stopped");
   }
 }
