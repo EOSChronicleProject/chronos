@@ -40,6 +40,7 @@ namespace {
 // scylla client threads may exit after main thread, so we we need to organize a clean aborting
 
 static std::mutex track_mtx;
+static std::mutex track_jobs_counter_mtx;
 static bool is_exiting = false;
 
 void atexit_handler()
@@ -55,8 +56,9 @@ struct block_track_entry {
   uint32_t trace_jobs_counter = 0;
   uint32_t db_req_counter = 0;
   uint32_t total_trx = 0;
+  bool     block_complete = false;
 
-  inline bool is_finished() const {return (trace_jobs_counter == 0 && db_req_counter == 0);}
+  inline bool is_finished() const {return (block_complete && trace_jobs_counter == 0 && db_req_counter == 0);}
 };
 
 
@@ -451,11 +453,7 @@ public:
     tracker_ptr->db_req_counter = 1;
 
     block_track_entry* tracker = tracker_ptr.get();
-
-    {
-      std::unique_lock<std::mutex> lock(track_mtx);
-      block_track_queue.push(tracker_ptr);
-    }
+    block_track_queue.push(tracker_ptr);
 
     CassStatement* statement = cass_prepared_bind(prepared_ins_pointers);
     size_t pos = 0;
@@ -478,7 +476,7 @@ public:
     std::shared_ptr<block_track_entry> tracker_ptr;
     block_track_entry* tracker;
     {
-      std::unique_lock<std::mutex> lock(track_mtx);
+      std::unique_lock<std::mutex> lock(track_jobs_counter_mtx);
       tracker_ptr = block_track_queue.back();
       tracker = tracker_ptr.get();
 
@@ -492,7 +490,8 @@ public:
     }
 
     auto job = make_shared<trace_job>();
-    job->tracker = tracker_ptr;
+    trace_job* job_entry = job.get();
+    job_entry->tracker = tracker_ptr;
 
     for( auto& atrace: trace.action_traces ) {
 
@@ -523,29 +522,29 @@ public:
         throw std::runtime_error(string("Invalid variant option in action_trace: ") + std::to_string(index));
       }
 
-      if( job->global_seq == 0 ) {
-        job->global_seq = receipt->global_sequence;
+      if( job_entry->global_seq == 0 ) {
+        job_entry->global_seq = receipt->global_sequence;
       }
 
 
-      if( job->recv_seq_start.count(receiver.value) == 0 ) {
-        job->recv_seq_start.insert_or_assign(receiver.value, receipt->recv_sequence);
+      if( job_entry->recv_seq_start.count(receiver.value) == 0 ) {
+        job_entry->recv_seq_start.insert_or_assign(receiver.value, receipt->recv_sequence);
       }
 
-      job->recv_seq_max.insert_or_assign(receiver.value, receipt->recv_sequence);
+      job_entry->recv_seq_max.insert_or_assign(receiver.value, receipt->recv_sequence);
 
       eosio::name contract = act->account;
       if( receiver == contract ) {
-        job->actions_seen[contract.value].insert(act->name.value);
+        job_entry->actions_seen[contract.value].insert(act->name.value);
       }
     }
 
-    if( job->global_seq == 0 ) {
+    if( job_entry->global_seq == 0 ) {
       throw std::runtime_error("global_seq is zero");
     }
 
-    job->trx_id = trace.id.extract_as_byte_array();
-    job->raw_trace.assign(ccttr->bin_start, ccttr->bin_start + ccttr->bin_size);
+    job_entry->trx_id = trace.id.extract_as_byte_array();
+    job_entry->raw_trace.assign(ccttr->bin_start, ccttr->bin_start + ccttr->bin_size);
 
     {
       std::unique_lock<std::mutex> lock(traces_queue_mutex);
@@ -702,7 +701,7 @@ public:
       }
     }
 
-    std::unique_lock<std::mutex> lock(track_mtx);
+    std::unique_lock<std::mutex> lock(track_jobs_counter_mtx);
     tracker->trace_jobs_counter--;
   }
 
@@ -712,7 +711,7 @@ public:
     size_t pos = 0;
     cass_statement_bind_int64(statement, pos++, abiupd->block_num);
     cass_statement_bind_string(statement, pos++, eosio::name_to_string(abiupd->account.value).c_str());
-    cass_statement_bind_bytes(statement, pos++, (cass_byte_t*) abiupd->bin_start, abiupd->bin_size);
+    cass_statement_bind_bytes(statement, pos++, (cass_byte_t*) abiupd->binary.data(), abiupd->binary.size());
     CassFuture* future = cass_session_execute(session, statement);
     check_future(future, "inserting abi_history");
     cass_future_free(future);
@@ -746,6 +745,7 @@ public:
     }
 
     block_track_entry* tracker = block_track_queue.back().get();
+    tracker->block_complete = true;
 
     if( is_bootstrapping ) {
       CassStatement* statement = cass_prepared_bind(prepared_ins_pointers);
@@ -794,10 +794,7 @@ public:
     uint32_t ack = 0;
     uint64_t date_max = 0;
 
-    {
-      std::unique_lock<std::mutex> lock(track_mtx);
-
-      if( !block_track_queue.empty() )
+    if( !block_track_queue.empty() ) {
       while( !block_track_queue.empty() && block_track_queue.front()->is_finished() ) {
         block_track_entry* tracker = block_track_queue.front().get();
         ack = tracker->block_num;
@@ -810,21 +807,21 @@ public:
       }
     }
 
-    // clean up old entries in the maps
-    {
-      std::unique_lock<std::mutex> lock(date_maps_mtx);
-      auto recepts_iter = receipt_date_written.begin();
-      while( recepts_iter->first < date_max ) {
-        recepts_iter = receipt_date_written.erase(recepts_iter);
-      }
-
-      auto actions_iter = action_date_written.begin();
-      while( actions_iter->first < date_max ) {
-        actions_iter = action_date_written.erase(actions_iter);
-      }
-    }
-
     if( ack > 0 ) {
+      // clean up old entries in the maps
+      {
+        std::unique_lock<std::mutex> lock(date_maps_mtx);
+        auto recepts_iter = receipt_date_written.begin();
+        while( recepts_iter->first < date_max ) {
+          recepts_iter = receipt_date_written.erase(recepts_iter);
+        }
+
+        auto actions_iter = action_date_written.begin();
+        while( actions_iter->first < date_max ) {
+          actions_iter = action_date_written.erase(actions_iter);
+        }
+      }
+
       ack_block(ack);
 
       if( block_counter >= 200 ) {
