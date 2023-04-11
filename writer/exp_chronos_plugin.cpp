@@ -348,6 +348,7 @@ public:
 
   void stop() {
     is_exiting = true;
+    traces_io_context.stop();
     traces_thread_group.join_all();
 
     CassFuture* future = cass_session_close(session);
