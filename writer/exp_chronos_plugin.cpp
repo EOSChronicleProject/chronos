@@ -27,12 +27,14 @@ namespace {
   const char* SCYLLA_HOSTS_OPT = "scylla-hosts";
   const char* SCYLLA_PORT_OPT = "scylla-port";
   const char* SCYLLA_KEYSPACE_OPT = "scylla-keyspace";
+  const char* SCYLLA_IO_THREADS_OPT = "scylla-io-threads";
   const char* SCYLLA_CONNS_PER_HOST_OPT = "scylla-connections-per-host";
   const char* SCYLLA_USERNAME_OPT = "scylla-username";
   const char* SCYLLA_PASSWORD_OPT = "scylla-password";
   const char* SCYLLA_CONSISTENCY_OPT = "scylla-consistency";
 
   const char* CHRONOS_MAXUNACK_OPT = "chronos-max-unack";
+  const char* CHRONOS_TRACE_THREADS_OPT = "chronos-trace-threads";
 
   const uint64_t MILLISECONDS_IN_A_DAY = 24 * 3600 * 1000;
 }
@@ -113,6 +115,7 @@ public:
   string scylla_hosts;
   uint16_t scylla_port;
   string scylla_keyspace;
+  uint16_t scylla_io_threads;
   uint16_t scylla_conn_per_host;
   string scylla_username;
   string scylla_password;
@@ -150,7 +153,7 @@ public:
 
   std::queue<std::shared_ptr<block_track_entry>>        block_track_queue;
 
-  size_t                             trace_treads = 4;
+  size_t                             trace_treads;
   boost::thread_group                traces_thread_group;
   boost::asio::io_context            traces_io_context;
   boost::asio::executor_work_guard<boost::asio::io_context::executor_type> traces_worker;
@@ -220,7 +223,7 @@ public:
     cass_cluster_set_local_port_range(cluster, 49152, 65535);
     cass_cluster_set_core_connections_per_host(cluster, scylla_conn_per_host);
     cass_cluster_set_request_timeout(cluster, 100000);
-    cass_cluster_set_num_threads_io(cluster, 4);
+    cass_cluster_set_num_threads_io(cluster, scylla_io_threads);
     cass_cluster_set_queue_size_io(cluster, 81920);
     if( scylla_username.size() > 0 ) {
       cass_cluster_set_credentials(cluster, scylla_username.c_str(), scylla_password.c_str());
@@ -830,8 +833,9 @@ public:
         uint32_t millisecs = diff.total_milliseconds();
 
         if( millisecs > 0 ) {
-          ilog("ack ${a}, blocks/s: ${b}, trx/s: ${t}",
-               ("a", ack)("b", 1000*block_counter/millisecs)("t", 1000*trx_counter/millisecs));
+          ilog("ack ${a}, blocks/s: ${b}, trx/s: ${t}, queue: ${q}",
+               ("a", ack)("b", 1000*block_counter/millisecs)("t", 1000*trx_counter/millisecs)
+               ("q", block_track_queue.size()));
 
           counter_start_time = now;
           block_counter = 0;
@@ -870,12 +874,14 @@ void exp_chronos_plugin::set_program_options( options_description& cli, options_
     (SCYLLA_HOSTS_OPT, bpo::value<string>(), "Comma-separated ScyllaDB server hosts")
     (SCYLLA_PORT_OPT, bpo::value<uint16_t>()->default_value(9042), "ScyllaDB server port")
     (SCYLLA_KEYSPACE_OPT, bpo::value<string>()->default_value("chronos"), "ScyllaDB keyspace")
-    (SCYLLA_CONNS_PER_HOST_OPT, bpo::value<uint16_t>()->default_value(32), "Number of connections per host")
+    (SCYLLA_IO_THREADS_OPT, bpo::value<uint16_t>()->default_value(4), "Number of Scylla client I/O threads")
+    (SCYLLA_CONNS_PER_HOST_OPT, bpo::value<uint16_t>()->default_value(1), "Number of Scylla client connections per host")
     (SCYLLA_USERNAME_OPT, bpo::value<string>(), "ScyllaDB authentication name")
     (SCYLLA_PASSWORD_OPT, bpo::value<string>(), "ScyllaDB authentication password")
     (SCYLLA_CONSISTENCY_OPT, bpo::value<uint16_t>()->default_value(CASS_CONSISTENCY_QUORUM), "Cluster consistency level")
     (CHRONOS_MAXUNACK_OPT, bpo::value<uint32_t>()->default_value(1000),
      "Receiver will pause at so many unacknowledged blocks")
+    (CHRONOS_TRACE_THREADS_OPT, bpo::value<uint16_t>()->default_value(4), "Number of trace processing threads")
     ;
 }
 
@@ -897,6 +903,7 @@ void exp_chronos_plugin::plugin_initialize( const variables_map& options ) {
     my->scylla_hosts = options.at(SCYLLA_HOSTS_OPT).as<string>();
     my->scylla_port = options.at(SCYLLA_PORT_OPT).as<uint16_t>();
     my->scylla_keyspace = options.at(SCYLLA_KEYSPACE_OPT).as<string>();
+    my->scylla_io_threads = options.at(SCYLLA_IO_THREADS_OPT).as<uint16_t>();
     my->scylla_conn_per_host = options.at(SCYLLA_CONNS_PER_HOST_OPT).as<uint16_t>();
 
 
@@ -916,6 +923,10 @@ void exp_chronos_plugin::plugin_initialize( const variables_map& options ) {
     my->maxunack = options.at(CHRONOS_MAXUNACK_OPT).as<uint32_t>();
     if( my->maxunack == 0 )
       throw std::runtime_error("Maximum unacked blocks must be a positive integer");
+
+    my->trace_treads = options.at(CHRONOS_TRACE_THREADS_OPT).as<uint16_t>();
+    if( my->trace_treads == 0 )
+      throw std::runtime_error("Maximum threads must be a positive integer");
 
     if( opt_missing )
       throw std::runtime_error("Mandatory option missing");
