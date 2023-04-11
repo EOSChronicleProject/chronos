@@ -72,6 +72,7 @@ void scylla_result_callback(CassFuture* future, void* data)
       string msg(message, message_length);
       elog("Error: ${e}", ("e",msg));
       abort_receiver();
+      return;
     }
 
     std::unique_lock<std::mutex> lock(track_mtx);
@@ -115,6 +116,7 @@ public:
   uint16_t scylla_conn_per_host;
   string scylla_username;
   string scylla_password;
+  CassConsistency scylla_consistency;
 
   uint32_t maxunack;
 
@@ -217,12 +219,13 @@ public:
     cass_cluster_set_contact_points(cluster, scylla_hosts.c_str());
     cass_cluster_set_local_port_range(cluster, 49152, 65535);
     cass_cluster_set_core_connections_per_host(cluster, scylla_conn_per_host);
-    cass_cluster_set_request_timeout(cluster, 0);
+    cass_cluster_set_request_timeout(cluster, 100000);
     cass_cluster_set_num_threads_io(cluster, 4);
     cass_cluster_set_queue_size_io(cluster, 81920);
     if( scylla_username.size() > 0 ) {
       cass_cluster_set_credentials(cluster, scylla_username.c_str(), scylla_password.c_str());
     }
+    cass_cluster_set_consistency(cluster, scylla_consistency);
 
     CassFuture* future;
 
@@ -232,9 +235,9 @@ public:
     cass_future_free(future);
 
     {
-      CassStatement* statement = cass_statement_new("SELECT ptr FROM pointers WHERE id=2", 0);
+      CassStatement* statement = cass_statement_new("SELECT ptr FROM pointers WHERE id=2", 0); // id=2: lowest block in history
       future = cass_session_execute(session, statement);
-      check_future(future, "quering");
+      check_future(future, "quering pointers");
       const CassResult* result = cass_future_get_result(future);
       if( cass_result_row_count(result) == 0 ) {
         is_bootstrapping = true;
@@ -244,16 +247,34 @@ public:
       cass_future_free(future);
     }
 
+    {
+      CassStatement* statement = cass_statement_new("SELECT ptr FROM pointers WHERE id=1", 0); // id=1: irreversible block,
+      future = cass_session_execute(session, statement);
+      check_future(future, "quering pointers");
+      const CassResult* result = cass_future_get_result(future);
+      if( cass_result_row_count(result) > 0 ) {
+        const CassRow* row = cass_result_first_row(result);
+        const CassValue* column1 = cass_row_get_column(row, 0);
+        int64_t val;
+        cass_value_get_int64(column1,  &val);
+        written_irreversible = (uint32_t) val;
+        ilog("Irreversible block from the database: ${b}", ("b", written_irreversible));
+      }
+      cass_result_free(result);
+      cass_statement_free(statement);
+      cass_future_free(future);
+    }
+
 
     future = cass_session_prepare
-      (session, "INSERT INTO pointers (id, ptr) VALUES (?,?)");
+      (session, "INSERT INTO pointers (id, ptr) VALUES (?,?) USING TIMEOUT 100s");
     check_future(future, "preparing ins_pointers");
     prepared_ins_pointers = cass_future_get_prepared(future);
     cass_future_free(future);
 
 
     future = cass_session_prepare
-      (session, "INSERT INTO transactions (block_num, block_time, seq, trx_id, trace) VALUES (?,?,?,?,?)");
+      (session, "INSERT INTO transactions (block_num, block_time, seq, trx_id, trace) VALUES (?,?,?,?,?) USING TIMEOUT 100s");
     check_future(future, "preparing ins_transactions");
     prepared_ins_transactions = cass_future_get_prepared(future);
     cass_future_free(future);
@@ -261,7 +282,7 @@ public:
 
     future = cass_session_prepare
       (session,
-       "INSERT INTO receipts (block_num, block_time, block_date, seq, account_name, recv_sequence_start, recv_sequence_count) VALUES (?,?,?,?,?,?,?)");
+       "INSERT INTO receipts (block_num, block_time, block_date, seq, account_name, recv_sequence_start, recv_sequence_count) VALUES (?,?,?,?,?,?,?) USING TIMEOUT 100s");
     check_future(future, "preparing ins_receipts");
     prepared_ins_receipts = cass_future_get_prepared(future);
     cass_future_free(future);
@@ -269,14 +290,14 @@ public:
 
     future = cass_session_prepare
       (session,
-       "INSERT INTO receipt_dates (account_name, block_date) VALUES (?,?)");
+       "INSERT INTO receipt_dates (account_name, block_date) VALUES (?,?) USING TIMEOUT 100s");
     check_future(future, "preparing ins_receipt_dates");
     prepared_ins_receipt_dates = cass_future_get_prepared(future);
     cass_future_free(future);
 
 
     future = cass_session_prepare
-      (session, "INSERT INTO actions (block_num, block_time, block_date, seq, contract, action) VALUES (?,?,?,?,?,?)");
+      (session, "INSERT INTO actions (block_num, block_time, block_date, seq, contract, action) VALUES (?,?,?,?,?,?) USING TIMEOUT 100s");
     check_future(future, "preparing ins_actions");
     prepared_ins_actions = cass_future_get_prepared(future);
     cass_future_free(future);
@@ -284,35 +305,35 @@ public:
 
     future = cass_session_prepare
       (session,
-       "INSERT INTO action_dates (contract, action, block_date) VALUES (?,?,?)");
+       "INSERT INTO action_dates (contract, action, block_date) VALUES (?,?,?) USING TIMEOUT 100s");
     check_future(future, "preparing ins_action_dates");
     prepared_ins_action_dates = cass_future_get_prepared(future);
     cass_future_free(future);
 
 
     future = cass_session_prepare
-      (session, "INSERT INTO abi_history (block_num, account_name, abi_raw) VALUES (?,?,?)");
+      (session, "INSERT INTO abi_history (block_num, account_name, abi_raw) VALUES (?,?,?) USING TIMEOUT 100s");
     check_future(future, "preparing ins_abi_history");
     prepared_ins_abi_history = cass_future_get_prepared(future);
     cass_future_free(future);
 
 
-    future = cass_session_prepare(session, "DELETE FROM transactions USING TIMEOUT 10s WHERE block_num=?");
+    future = cass_session_prepare(session, "DELETE FROM transactions USING TIMEOUT 100s WHERE block_num=?");
     check_future(future, "preparing del_transactions");
     prepared_del_transactions = cass_future_get_prepared(future);
     cass_future_free(future);
 
-    future = cass_session_prepare(session, "DELETE FROM receipts USING TIMEOUT 10s WHERE block_num=?");
+    future = cass_session_prepare(session, "DELETE FROM receipts USING TIMEOUT 100s WHERE block_num=?");
     check_future(future, "preparing del_receipts");
     prepared_del_receipts = cass_future_get_prepared(future);
     cass_future_free(future);
 
-    future = cass_session_prepare(session, "DELETE FROM actions USING TIMEOUT 10s WHERE block_num=?");
+    future = cass_session_prepare(session, "DELETE FROM actions USING TIMEOUT 100s WHERE block_num=?");
     check_future(future, "preparing del_actions");
     prepared_del_actions = cass_future_get_prepared(future);
     cass_future_free(future);
 
-    future = cass_session_prepare(session, "DELETE FROM abi_history USING TIMEOUT 10s WHERE block_num=?");
+    future = cass_session_prepare(session, "DELETE FROM abi_history USING TIMEOUT 100s WHERE block_num=?");
     check_future(future, "preparing del_abi_history");
     prepared_del_abi_history = cass_future_get_prepared(future);
     cass_future_free(future);
@@ -370,6 +391,8 @@ public:
   }
 
   void on_fork(std::shared_ptr<chronicle::channels::fork_event> fe) {
+    ilog("fork: ${f}", ("f", fe->block_num));
+
     {
       std::unique_lock<std::mutex> lock(track_mtx);
       while( !block_track_queue.empty() && block_track_queue.front()->is_finished() ) {
@@ -404,7 +427,7 @@ public:
       if( last_written_block > 0 ) { // delete all written data down to the forked block
         ilog("Deleting data between blocks ${s} and ${e}", ("s", fe->block_num)("e", last_written_block));
 
-        while( last_written_block >= fe->block_num ) {
+        while( last_written_block >= fe->block_num && last_written_block > written_irreversible ) {
           statement = cass_prepared_bind(prepared_del_transactions);
           cass_statement_bind_int64(statement, 0, last_written_block);
           future = cass_session_execute(session, statement);
@@ -451,24 +474,31 @@ public:
     tracker_ptr->block_num = bb->block_num;
     tracker_ptr->block_timestamp = block_timestamp;
     tracker_ptr->block_date = block_date;
-    tracker_ptr->db_req_counter = 1;
-
-    block_track_entry* tracker = tracker_ptr.get();
     block_track_queue.push(tracker_ptr);
 
-    CassStatement* statement = cass_prepared_bind(prepared_ins_pointers);
-    size_t pos = 0;
-    cass_statement_bind_int32(statement, pos++, 0); // id=0: last written block
-    cass_statement_bind_int64(statement, pos++, bb->block_num); // id=0: last written block
+    if( bb->block_num > written_irreversible ) {
+      tracker_ptr->db_req_counter = 1;
 
-    CassFuture* future = cass_session_execute(session, statement);
-    cass_future_set_callback(future, scylla_result_callback, tracker);
-    cass_future_free(future);
-    cass_statement_free(statement);
+      block_track_entry* tracker = tracker_ptr.get();
+
+      CassStatement* statement = cass_prepared_bind(prepared_ins_pointers);
+      size_t pos = 0;
+      cass_statement_bind_int32(statement, pos++, 0); // id=0: last written block
+      cass_statement_bind_int64(statement, pos++, bb->block_num);
+
+      CassFuture* future = cass_session_execute(session, statement);
+      cass_future_set_callback(future, scylla_result_callback, tracker);
+      cass_future_free(future);
+      cass_statement_free(statement);
+    }
   }
 
 
   void on_transaction_trace(std::shared_ptr<chronicle::channels::transaction_trace> ccttr) {
+    if( ccttr->block_num <= written_irreversible ) {
+      return;
+    }
+
     auto& trace = std::get<eosio::ship_protocol::transaction_trace_v0>(ccttr->trace);
     if( trace.status != eosio::ship_protocol::transaction_status::executed ) {
       return;
@@ -738,23 +768,35 @@ public:
       is_bootstrapping = false;
     }
 
-    if( bf->last_irreversible > written_irreversible ) {
-      CassStatement* statement = cass_prepared_bind(prepared_ins_pointers);
-      size_t pos = 0;
-      cass_statement_bind_int32(statement, pos++, 1); // id=1: irreversible block,
-      cass_statement_bind_int64(statement, pos++, bf->block_num);
+    if( bf->block_num > written_irreversible ) {
+      if( bf->last_irreversible > written_irreversible ) {
+        uint32_t old_written_irreversible = written_irreversible;
+        if( bf->last_irreversible > bf->block_num ) {
+          // last irreversible is in the future, we are catching up through the old history
+          written_irreversible = bf->block_num;
+        }
+        else {
+          // we are near the head block
+          written_irreversible = bf->last_irreversible;
+        }
 
-      {
-        std::unique_lock<std::mutex> lock(track_mtx);
-        tracker->db_req_counter++;
+        if( written_irreversible > old_written_irreversible ) {
+          CassStatement* statement = cass_prepared_bind(prepared_ins_pointers);
+          size_t pos = 0;
+          cass_statement_bind_int32(statement, pos++, 1); // id=1: irreversible block,
+          cass_statement_bind_int64(statement, pos++, written_irreversible);
+
+          {
+            std::unique_lock<std::mutex> lock(track_mtx);
+            tracker->db_req_counter++;
+          }
+
+          CassFuture* future = cass_session_execute(session, statement);
+          cass_future_set_callback(future, scylla_result_callback, tracker);
+          cass_future_free(future);
+          cass_statement_free(statement);
+        }
       }
-
-      CassFuture* future = cass_session_execute(session, statement);
-      cass_future_set_callback(future, scylla_result_callback, tracker);
-      cass_future_free(future);
-      cass_statement_free(statement);
-
-      written_irreversible = bf->last_irreversible;
     }
 
     ack_finished_blocks();
@@ -800,12 +842,12 @@ public:
         {
           std::unique_lock<std::mutex> lock(date_maps_mtx);
           auto recepts_iter = receipt_date_written.begin();
-          while( recepts_iter->first < date_max ) {
+          while( recepts_iter != receipt_date_written.end() && recepts_iter->first < date_max ) {
             recepts_iter = receipt_date_written.erase(recepts_iter);
           }
 
           auto actions_iter = action_date_written.begin();
-          while( actions_iter->first < date_max ) {
+          while( actions_iter != action_date_written.end() && actions_iter->first < date_max ) {
             actions_iter = action_date_written.erase(actions_iter);
           }
         }
@@ -868,6 +910,8 @@ void exp_chronos_plugin::plugin_initialize( const variables_map& options ) {
         my->scylla_password = options.at(SCYLLA_PASSWORD_OPT).as<string>();
       }
     }
+
+    my->scylla_consistency = (CassConsistency) options.at(SCYLLA_CONSISTENCY_OPT).as<uint16_t>();
 
     my->maxunack = options.at(CHRONOS_MAXUNACK_OPT).as<uint32_t>();
     if( my->maxunack == 0 )
