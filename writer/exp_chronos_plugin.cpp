@@ -96,6 +96,10 @@ struct trace_job {
   std::map<uint64_t, std::set<uint64_t>>    actions_seen;
   std::array<uint8_t,32>                    trx_id;
   std::vector<uint8_t>                      raw_trace;
+  std::shared_ptr<flat_buffer>              buffer; /* original buffer filled by receiver plugin.
+                                                       This ptr makes sure it stays allocated while we need it */
+  const char*                               raw_trace_start; // bytes in the buffer
+  size_t                                    raw_trace_size;
 };
 
 
@@ -575,7 +579,9 @@ public:
     }
 
     job_entry->trx_id = trace.id.extract_as_byte_array();
-    job_entry->raw_trace.assign(ccttr->bin_start, ccttr->bin_start + ccttr->bin_size);
+    job_entry->buffer = ccttr->buffer;
+    job_entry->raw_trace_start = ccttr->bin_start;
+    job_entry->raw_trace_size = ccttr->bin_size;
 
     traces_io_context.post(boost::bind(&exp_chronos_plugin_impl::process_transaction_trace, this, job));
   }
@@ -601,7 +607,7 @@ public:
       cass_statement_bind_int64(statement, pos++, block_timestamp);
       cass_statement_bind_int64(statement, pos++, global_seq);
       cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)job->trx_id.data(), job->trx_id.size());
-      cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)job->raw_trace.data(), job->raw_trace.size());
+      cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)job->raw_trace_start, job->raw_trace_size);
 
       {
         std::unique_lock<std::mutex> lock(track_mtx);
