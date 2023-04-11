@@ -89,17 +89,8 @@ void scylla_result_callback(CassFuture* future, void* data)
 }
 
 struct trace_job {
-  std::shared_ptr<block_track_entry>        tracker;
-  uint64_t                                  global_seq = 0;
-  std::map<uint64_t, uint64_t>              recv_seq_start;
-  std::map<uint64_t, uint64_t>              recv_seq_max;
-  std::map<uint64_t, std::set<uint64_t>>    actions_seen;
-  std::array<uint8_t,32>                    trx_id;
-  std::vector<uint8_t>                      raw_trace;
-  std::shared_ptr<flat_buffer>              buffer; /* original buffer filled by receiver plugin.
-                                                       This ptr makes sure it stays allocated while we need it */
-  const char*                               raw_trace_start; // bytes in the buffer
-  size_t                                    raw_trace_size;
+  std::shared_ptr<block_track_entry>                      tracker;
+  std::shared_ptr<chronicle::channels::transaction_trace> ccttr;
 };
 
 
@@ -528,6 +519,24 @@ public:
     auto job = make_shared<trace_job>();
     trace_job* job_entry = job.get();
     job_entry->tracker = tracker_ptr;
+    job_entry->ccttr = ccttr;
+
+    traces_io_context.post(boost::bind(&exp_chronos_plugin_impl::process_transaction_trace, this, job));
+  }
+
+
+  void process_transaction_trace(std::shared_ptr<trace_job> job)
+  {
+    if( is_exiting ) {
+      return;
+    }
+
+    auto& trace = std::get<eosio::ship_protocol::transaction_trace_v0>(job->ccttr->trace);
+
+    uint64_t                                  global_seq = 0;
+    std::map<uint64_t, uint64_t>              recv_seq_start;
+    std::map<uint64_t, uint64_t>              recv_seq_max;
+    std::map<uint64_t, std::set<uint64_t>>    actions_seen;
 
     for( auto& atrace: trace.action_traces ) {
 
@@ -558,47 +567,31 @@ public:
         throw std::runtime_error(string("Invalid variant option in action_trace: ") + std::to_string(index));
       }
 
-      if( job_entry->global_seq == 0 ) {
-        job_entry->global_seq = receipt->global_sequence;
+      if( global_seq == 0 ) {
+        global_seq = receipt->global_sequence;
       }
 
-      if( job_entry->recv_seq_start.count(receiver.value) == 0 ) {
-        job_entry->recv_seq_start.insert_or_assign(receiver.value, receipt->recv_sequence);
+      if( recv_seq_start.count(receiver.value) == 0 ) {
+        recv_seq_start.insert_or_assign(receiver.value, receipt->recv_sequence);
       }
 
-      job_entry->recv_seq_max.insert_or_assign(receiver.value, receipt->recv_sequence);
+      recv_seq_max.insert_or_assign(receiver.value, receipt->recv_sequence);
 
-      eosio::name contract = act->account;
-      if( receiver == contract ) {
-        job_entry->actions_seen[contract.value].insert(act->name.value);
+      if( receiver == act->account ) {
+        actions_seen[act->account.value].insert(act->name.value);
       }
     }
 
-    if( job_entry->global_seq == 0 ) {
+    if( global_seq == 0 ) {
       throw std::runtime_error("global_seq is zero");
     }
 
-    job_entry->trx_id = trace.id.extract_as_byte_array();
-    job_entry->buffer = ccttr->buffer;
-    job_entry->raw_trace_start = ccttr->bin_start;
-    job_entry->raw_trace_size = ccttr->bin_size;
-
-    traces_io_context.post(boost::bind(&exp_chronos_plugin_impl::process_transaction_trace, this, job));
-  }
-
-
-  void process_transaction_trace(std::shared_ptr<trace_job> job)
-  {
-    if( is_exiting ) {
-      return;
-    }
+    const std::array<uint8_t,32>& trx_id = trace.id.extract_as_byte_array();
 
     block_track_entry* tracker = job->tracker.get();
-
     uint32_t block_num = tracker->block_num;
     uint64_t block_timestamp = tracker->block_timestamp;
     uint64_t block_date = tracker->block_date;
-    uint64_t global_seq = job->global_seq;
 
     {
       CassStatement* statement = cass_prepared_bind(prepared_ins_transactions);
@@ -606,8 +599,8 @@ public:
       cass_statement_bind_int64(statement, pos++, block_num);
       cass_statement_bind_int64(statement, pos++, block_timestamp);
       cass_statement_bind_int64(statement, pos++, global_seq);
-      cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)job->trx_id.data(), job->trx_id.size());
-      cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)job->raw_trace_start, job->raw_trace_size);
+      cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)trx_id.data(), trx_id.size());
+      cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)job->ccttr->bin_start, job->ccttr->bin_size);
 
       {
         std::unique_lock<std::mutex> lock(track_mtx);
@@ -620,7 +613,7 @@ public:
       cass_statement_free(statement);
     }
 
-    for(auto item: job->recv_seq_start) {
+    for(auto item: recv_seq_start) {
       {
         CassStatement* statement = cass_prepared_bind(prepared_ins_receipts);
         size_t pos = 0;
@@ -630,7 +623,7 @@ public:
         cass_statement_bind_int64(statement, pos++, global_seq);
         cass_statement_bind_string(statement, pos++, eosio::name_to_string(item.first).c_str());
         cass_statement_bind_int64(statement, pos++, item.second);
-        cass_statement_bind_int64(statement, pos++, job->recv_seq_max.at(item.first) - item.second + 1);
+        cass_statement_bind_int64(statement, pos++, recv_seq_max.at(item.first) - item.second + 1);
 
         {
           std::unique_lock<std::mutex> lock(track_mtx);
@@ -665,7 +658,7 @@ public:
       }
     }
 
-    for(auto item: job->actions_seen) {
+    for(auto item: actions_seen) {
       for(auto aname: item.second) {
         {
           CassStatement* statement = cass_prepared_bind(prepared_ins_actions);
