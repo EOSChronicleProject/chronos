@@ -14,6 +14,22 @@ CREATE TABLE pointers
 );
 
 
+CREATE TABLE blocks
+(
+ block_num         BIGINT,
+ block_time        TIMESTAMP,
+ block_id          BLOB,
+ producer          ASCII,
+ previous          BLOB,
+ transaction_mroot BLOB,
+ action_mroot      BLOB,
+ trx_count         INT,
+ PRIMARY KEY (block_num)
+);
+
+CREATE INDEX blocks_id ON blocks (block_id);
+
+
 CREATE TABLE transactions
 (
  block_num         BIGINT,

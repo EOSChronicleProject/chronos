@@ -124,6 +124,7 @@ public:
   bool is_bootstrapping = false;
 
   const CassPrepared* prepared_ins_pointers;
+  const CassPrepared* prepared_ins_blocks;
   const CassPrepared* prepared_ins_transactions;
   const CassPrepared* prepared_ins_receipts;
   const CassPrepared* prepared_ins_receipt_dates;
@@ -131,6 +132,7 @@ public:
   const CassPrepared* prepared_ins_action_dates;
   const CassPrepared* prepared_ins_abi_history;
 
+  const CassPrepared* prepared_del_blocks;
   const CassPrepared* prepared_del_transactions;
   const CassPrepared* prepared_del_receipts;
   const CassPrepared* prepared_del_actions;
@@ -272,6 +274,13 @@ public:
 
 
     future = cass_session_prepare
+      (session, "INSERT INTO blocks (block_num, block_time, block_id, producer, previous, transaction_mroot, action_mroot, trx_count) VALUES (?,?,?,?,?,?,?,?) USING TIMEOUT 100s");
+    check_future(future, "preparing ins_blocks");
+    prepared_ins_blocks = cass_future_get_prepared(future);
+    cass_future_free(future);
+
+
+    future = cass_session_prepare
       (session, "INSERT INTO transactions (block_num, block_time, seq, trx_id, trace) VALUES (?,?,?,?,?) USING TIMEOUT 100s");
     check_future(future, "preparing ins_transactions");
     prepared_ins_transactions = cass_future_get_prepared(future);
@@ -315,6 +324,11 @@ public:
     prepared_ins_abi_history = cass_future_get_prepared(future);
     cass_future_free(future);
 
+
+    future = cass_session_prepare(session, "DELETE FROM blocks USING TIMEOUT 100s WHERE block_num=?");
+    check_future(future, "preparing del_blocks");
+    prepared_del_blocks = cass_future_get_prepared(future);
+    cass_future_free(future);
 
     future = cass_session_prepare(session, "DELETE FROM transactions USING TIMEOUT 100s WHERE block_num=?");
     check_future(future, "preparing del_transactions");
@@ -426,6 +440,13 @@ public:
         ilog("Deleting data between blocks ${s} and ${e}", ("s", fe->block_num)("e", last_written_block));
 
         while( last_written_block >= fe->block_num && last_written_block > written_irreversible ) {
+          statement = cass_prepared_bind(prepared_del_blocks);
+          cass_statement_bind_int64(statement, 0, last_written_block);
+          future = cass_session_execute(session, statement);
+          check_future(future, "deleting forked blocks");
+          cass_future_free(future);
+          cass_statement_free(statement);
+
           statement = cass_prepared_bind(prepared_del_transactions);
           cass_statement_bind_int64(statement, 0, last_written_block);
           future = cass_session_execute(session, statement);
@@ -749,7 +770,35 @@ public:
     }
 
     block_track_entry* tracker = block_track_queue.back().get();
-    tracker->block_complete = true;
+
+    {
+      const std::array<uint8_t,32>& block_id = bf->block_id.extract_as_byte_array();
+      const std::array<uint8_t,32>& previous = bf->previous.extract_as_byte_array();
+      const std::array<uint8_t,32>& transaction_mroot = bf->transaction_mroot.extract_as_byte_array();
+      const std::array<uint8_t,32>& action_mroot = bf->action_mroot.extract_as_byte_array();
+
+      CassStatement* statement = cass_prepared_bind(prepared_ins_blocks);
+      size_t pos = 0;
+      cass_statement_bind_int64(statement, pos++, bf->block_num);
+      cass_statement_bind_int64(statement, pos++, tracker->block_timestamp);
+      cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)block_id.data(), block_id.size());
+      cass_statement_bind_string(statement, pos++, eosio::name_to_string(bf->producer.value).c_str());
+      cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)previous.data(), previous.size());
+      cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)transaction_mroot.data(), transaction_mroot.size());
+      cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)action_mroot.data(), action_mroot.size());
+      cass_statement_bind_int32(statement, pos++, bf->trx_count);
+
+      {
+        std::unique_lock<std::mutex> lock(track_mtx);
+        tracker->db_req_counter++;
+        tracker->block_complete = true;
+      }
+
+      CassFuture* future = cass_session_execute(session, statement);
+      cass_future_set_callback(future, scylla_result_callback, tracker);
+      cass_future_free(future);
+      cass_statement_free(statement);
+    }
 
     if( is_bootstrapping ) {
       CassStatement* statement = cass_prepared_bind(prepared_ins_pointers);
