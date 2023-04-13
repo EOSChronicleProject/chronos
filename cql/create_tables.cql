@@ -18,6 +18,7 @@ CREATE TABLE blocks
 (
  block_num         BIGINT,
  block_time        TIMESTAMP,
+ block_date        BIGINT,
  block_id          BLOB,
  producer          ASCII,
  previous          BLOB,
@@ -28,6 +29,12 @@ CREATE TABLE blocks
 );
 
 CREATE INDEX blocks_id ON blocks (block_id);
+
+CREATE MATERIALIZED VIEW block_by_date AS
+    SELECT *    
+    FROM blocks
+    WHERE block_num IS NOT NULL AND block_date IS NOT NULL
+    PRIMARY KEY (block_date, block_num);
 
 
 CREATE TABLE transactions

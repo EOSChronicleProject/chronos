@@ -274,7 +274,7 @@ public:
 
 
     future = cass_session_prepare
-      (session, "INSERT INTO blocks (block_num, block_time, block_id, producer, previous, transaction_mroot, action_mroot, trx_count) VALUES (?,?,?,?,?,?,?,?) USING TIMEOUT 100s");
+      (session, "INSERT INTO blocks (block_num, block_time, block_date, block_id, producer, previous, transaction_mroot, action_mroot, trx_count) VALUES (?,?,?,?,?,?,?,?,?) USING TIMEOUT 100s");
     check_future(future, "preparing ins_blocks");
     prepared_ins_blocks = cass_future_get_prepared(future);
     cass_future_free(future);
@@ -781,6 +781,7 @@ public:
       size_t pos = 0;
       cass_statement_bind_int64(statement, pos++, bf->block_num);
       cass_statement_bind_int64(statement, pos++, tracker->block_timestamp);
+      cass_statement_bind_int64(statement, pos++, tracker->block_date);
       cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)block_id.data(), block_id.size());
       cass_statement_bind_string(statement, pos++, eosio::name_to_string(bf->producer.value).c_str());
       cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)previous.data(), previous.size());
@@ -859,36 +860,32 @@ public:
     uint32_t ack = 0;
     uint64_t date_max = 0;
 
-    if( !block_track_queue.empty() ) {
-      while( !block_track_queue.empty() && block_track_queue.front()->is_finished() ) {
-        block_track_entry* tracker = block_track_queue.front().get();
-        ack = tracker->block_num;
-        trx_counter += tracker->total_trx;
-        if( date_max < tracker->block_date ) {
-          date_max = tracker->block_date;
-        }
-        block_track_queue.pop();
-        block_counter++;
+    while( !block_track_queue.empty() && block_track_queue.front()->is_finished() ) {
+      block_track_entry* tracker = block_track_queue.front().get();
+      ack = tracker->block_num;
+      trx_counter += tracker->total_trx;
+      if( date_max < tracker->block_date ) {
+        date_max = tracker->block_date;
       }
+      block_track_queue.pop();
+      block_counter++;
     }
 
     if( ack > 0 ) {
       ack_block(ack);
 
-      if( block_counter >= 200 ) {
-        boost::posix_time::ptime now = boost::posix_time::microsec_clock::local_time();
-        boost::posix_time::time_duration diff = now - counter_start_time;
-        uint32_t millisecs = diff.total_milliseconds();
+      boost::posix_time::ptime now = boost::posix_time::microsec_clock::local_time();
+      boost::posix_time::time_duration diff = now - counter_start_time;
+      uint32_t millisecs = diff.total_milliseconds();
 
-        if( millisecs > 0 ) {
-          ilog("ack ${a}, blocks/s: ${b}, trx/s: ${t}, queue: ${q}",
-               ("a", ack)("b", 1000*block_counter/millisecs)("t", 1000*trx_counter/millisecs)
-               ("q", block_track_queue.size()));
+      if( millisecs > 1000 ) {
+        ilog("ack ${a}, blocks/s: ${b}, trx/s: ${t}, queue: ${q}",
+             ("a", ack)("b", 1000*block_counter/millisecs)("t", 1000*trx_counter/millisecs)
+             ("q", block_track_queue.size()));
 
-          counter_start_time = now;
-          block_counter = 0;
-          trx_counter = 0;
-        }
+        counter_start_time = now;
+        block_counter = 0;
+        trx_counter = 0;
 
         // clean up old entries in the maps
         {
