@@ -27,6 +27,8 @@ Chronos is implemented as a plugin for
 
 ## Performance benchmarks
 
+### WAX mainnet test
+
 Testing environment: a ScyllaDB cluster on four AX101 servers at
 Hetzner in the same datacenter (16-core AMD Ryzen 9 5950X, 128GB ECC
 RAM, 2 x 3.84 TB NVMe drives in RAID0, running XFS filesystem).
@@ -62,6 +64,34 @@ million blocks.
 This data density is approximately the same as observed on a WAX
 Hyperion server.
 
+
+### Proton mainnet test
+
+The same server environment was also used for Proton mainnet tests. As
+the history size is smaller, it is easier to compare the performance
+with Hyperion. The full Proton history as of this writing was indexed
+in about 12 hours.
+
+Storage use:
+
+```
+root@scylla-fi01 ~ # nodetool status
+Datacenter: hel_dc5
+===================
+Status=Up/Down
+|/ State=Normal/Leaving/Joining/Moving
+--  Address        Load       Tokens       Owns    Host ID                               Rack
+UN  65.109.115.25  188.42 GB  256          ?       1e4a0e34-45db-4b13-a559-2b06e04a9f40  rack1
+UN  65.109.89.138  202.17 GB  256          ?       0ba9877a-08c4-4efe-a21f-90bf8492cb3b  rack1
+UN  65.109.88.214  204.32 GB  256          ?       aab1ec1a-37be-409c-873a-93fcc4846198  rack1
+UN  65.109.50.146  201.29 GB  256          ?       4dffa6b6-a6ce-48f0-b8b7-a9c81af745b4  rack1
+```
+
+This gives 265.40 GB for a single-copy installation. The full Proton Hyperion database is 793 GB.
+
+Also, the full Proton
+[Memento](https://github.com/Antelope-Memento/antelope_memento)
+database on Postgres, using ZFS compression, occupies 563 GB.
 
 
 
