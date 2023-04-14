@@ -734,29 +734,33 @@ public:
 
 
   void on_abi_update(std::shared_ptr<chronicle::channels::abi_update> abiupd) {
-    CassStatement* statement = cass_prepared_bind(prepared_ins_abi_history);
-    size_t pos = 0;
-    cass_statement_bind_int64(statement, pos++, abiupd->block_num);
-    cass_statement_bind_string(statement, pos++, eosio::name_to_string(abiupd->account.value).c_str());
-    cass_statement_bind_bytes(statement, pos++, (cass_byte_t*) abiupd->binary.data(), abiupd->binary.size());
-    CassFuture* future = cass_session_execute(session, statement);
-    check_future(future, "inserting abi_history");
-    cass_future_free(future);
-    cass_statement_free(statement);
+    if( abiupd->block_num > written_irreversible ) {
+      CassStatement* statement = cass_prepared_bind(prepared_ins_abi_history);
+      size_t pos = 0;
+      cass_statement_bind_int64(statement, pos++, abiupd->block_num);
+      cass_statement_bind_string(statement, pos++, eosio::name_to_string(abiupd->account.value).c_str());
+      cass_statement_bind_bytes(statement, pos++, (cass_byte_t*) abiupd->binary.data(), abiupd->binary.size());
+      CassFuture* future = cass_session_execute(session, statement);
+      check_future(future, "inserting abi_history");
+      cass_future_free(future);
+      cass_statement_free(statement);
+    }
   }
 
 
   void on_abi_removal(std::shared_ptr<chronicle::channels::abi_removal> ar) {
-    CassStatement* statement = cass_prepared_bind(prepared_ins_abi_history);
-    size_t pos = 0;
-    cass_statement_bind_int64(statement, pos++, ar->block_num);
-    cass_statement_bind_string(statement, pos++, eosio::name_to_string(ar->account.value).c_str());
-    string empty;
-    cass_statement_bind_bytes(statement, pos++, (cass_byte_t*) empty.data(), 0);
-    CassFuture* future = cass_session_execute(session, statement);
-    check_future(future, "inserting empty abi_history");
-    cass_future_free(future);
-    cass_statement_free(statement);
+    if( ar->block_num > written_irreversible ) {
+      CassStatement* statement = cass_prepared_bind(prepared_ins_abi_history);
+      size_t pos = 0;
+      cass_statement_bind_int64(statement, pos++, ar->block_num);
+      cass_statement_bind_string(statement, pos++, eosio::name_to_string(ar->account.value).c_str());
+      string empty;
+      cass_statement_bind_bytes(statement, pos++, (cass_byte_t*) empty.data(), 0);
+      CassFuture* future = cass_session_execute(session, statement);
+      check_future(future, "inserting empty abi_history");
+      cass_future_free(future);
+      cass_statement_free(statement);
+    }
   }
 
 
@@ -773,56 +777,55 @@ public:
 
     block_track_entry* tracker = block_track_queue.back().get();
 
-    {
-      const std::array<uint8_t,32>& block_id = bf->block_id.extract_as_byte_array();
-      const std::array<uint8_t,32>& previous = bf->previous.extract_as_byte_array();
-      const std::array<uint8_t,32>& transaction_mroot = bf->transaction_mroot.extract_as_byte_array();
-      const std::array<uint8_t,32>& action_mroot = bf->action_mroot.extract_as_byte_array();
-
-      CassStatement* statement = cass_prepared_bind(prepared_ins_blocks);
-      size_t pos = 0;
-      cass_statement_bind_int64(statement, pos++, bf->block_num);
-      cass_statement_bind_int64(statement, pos++, tracker->block_timestamp);
-      cass_statement_bind_int64(statement, pos++, tracker->block_date);
-      cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)block_id.data(), block_id.size());
-      cass_statement_bind_string(statement, pos++, eosio::name_to_string(bf->producer.value).c_str());
-      cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)previous.data(), previous.size());
-      cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)transaction_mroot.data(), transaction_mroot.size());
-      cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)action_mroot.data(), action_mroot.size());
-      cass_statement_bind_int32(statement, pos++, bf->trx_count);
-
-      {
-        std::unique_lock<std::mutex> lock(track_mtx);
-        tracker->db_req_counter++;
-        tracker->block_complete = true;
-      }
-
-      CassFuture* future = cass_session_execute(session, statement);
-      cass_future_set_callback(future, scylla_result_callback, tracker);
-      cass_future_free(future);
-      cass_statement_free(statement);
-    }
-
-    if( is_bootstrapping ) {
-      CassStatement* statement = cass_prepared_bind(prepared_ins_pointers);
-      size_t pos = 0;
-      cass_statement_bind_int32(statement, pos++, 2); // id=2: lowest block in history
-      cass_statement_bind_int64(statement, pos++, bf->block_num);
-
-      {
-        std::unique_lock<std::mutex> lock(track_mtx);
-        tracker->db_req_counter++;
-      }
-
-      CassFuture* future = cass_session_execute(session, statement);
-      cass_future_set_callback(future, scylla_result_callback, tracker);
-      cass_future_free(future);
-      cass_statement_free(statement);
-
-      is_bootstrapping = false;
-    }
-
     if( bf->block_num > written_irreversible ) {
+      {
+        const std::array<uint8_t,32>& block_id = bf->block_id.extract_as_byte_array();
+        const std::array<uint8_t,32>& previous = bf->previous.extract_as_byte_array();
+        const std::array<uint8_t,32>& transaction_mroot = bf->transaction_mroot.extract_as_byte_array();
+        const std::array<uint8_t,32>& action_mroot = bf->action_mroot.extract_as_byte_array();
+
+        CassStatement* statement = cass_prepared_bind(prepared_ins_blocks);
+        size_t pos = 0;
+        cass_statement_bind_int64(statement, pos++, bf->block_num);
+        cass_statement_bind_int64(statement, pos++, tracker->block_timestamp);
+        cass_statement_bind_int64(statement, pos++, tracker->block_date);
+        cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)block_id.data(), block_id.size());
+        cass_statement_bind_string(statement, pos++, eosio::name_to_string(bf->producer.value).c_str());
+        cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)previous.data(), previous.size());
+        cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)transaction_mroot.data(), transaction_mroot.size());
+        cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)action_mroot.data(), action_mroot.size());
+        cass_statement_bind_int32(statement, pos++, bf->trx_count);
+
+        {
+          std::unique_lock<std::mutex> lock(track_mtx);
+          tracker->db_req_counter++;
+        }
+
+        CassFuture* future = cass_session_execute(session, statement);
+        cass_future_set_callback(future, scylla_result_callback, tracker);
+        cass_future_free(future);
+        cass_statement_free(statement);
+      }
+
+      if( is_bootstrapping ) {
+        CassStatement* statement = cass_prepared_bind(prepared_ins_pointers);
+        size_t pos = 0;
+        cass_statement_bind_int32(statement, pos++, 2); // id=2: lowest block in history
+        cass_statement_bind_int64(statement, pos++, bf->block_num);
+
+        {
+          std::unique_lock<std::mutex> lock(track_mtx);
+          tracker->db_req_counter++;
+        }
+
+        CassFuture* future = cass_session_execute(session, statement);
+        cass_future_set_callback(future, scylla_result_callback, tracker);
+        cass_future_free(future);
+        cass_statement_free(statement);
+
+        is_bootstrapping = false;
+      }
+
       if( bf->last_irreversible > written_irreversible ) {
         uint32_t old_written_irreversible = written_irreversible;
         if( bf->last_irreversible > bf->block_num ) {
@@ -851,6 +854,11 @@ public:
           cass_statement_free(statement);
         }
       }
+    }
+
+    {
+      std::unique_lock<std::mutex> lock(track_mtx);
+      tracker->block_complete = true;
     }
 
     ack_finished_blocks();
