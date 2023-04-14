@@ -74,7 +74,7 @@ void scylla_result_callback(CassFuture* future, void* data)
       cass_future_error_message(future, &message, &message_length);
       string msg(message, message_length);
       elog("Error: ${e}", ("e",msg));
-      abort_receiver();
+      is_exiting = true;
       return;
     }
 
@@ -83,7 +83,7 @@ void scylla_result_callback(CassFuture* future, void* data)
 
     if( tracker->db_req_counter == 0 ) {
       elog("tracker underflow, block= ${b}", ("b",tracker->block_num));
-      abort_receiver();
+      is_exiting = true;
     }
     tracker->db_req_counter--;
     global_db_req_counter++;
@@ -488,6 +488,11 @@ public:
 
 
   void on_block_started(std::shared_ptr<chronicle::channels::block_begins> bb) {
+    if( is_exiting ) {
+      abort_receiver();
+      return;
+    }
+
     uint64_t block_timestamp = bb->block_timestamp.to_time_point().elapsed.count() / 1000;
     uint64_t block_date = block_timestamp - (block_timestamp % MILLISECONDS_IN_A_DAY);
 
