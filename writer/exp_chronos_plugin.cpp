@@ -44,6 +44,7 @@ namespace {
 static std::mutex track_mtx;
 static std::mutex track_jobs_counter_mtx;
 static bool is_exiting = false;
+static uint32_t global_db_req_counter = 0;
 
 void atexit_handler()
 {
@@ -85,6 +86,7 @@ void scylla_result_callback(CassFuture* future, void* data)
       abort_receiver();
     }
     tracker->db_req_counter--;
+    global_db_req_counter++;
   }
 }
 
@@ -221,7 +223,7 @@ public:
     cass_cluster_set_core_connections_per_host(cluster, scylla_conn_per_host);
     cass_cluster_set_request_timeout(cluster, 100000);
     cass_cluster_set_num_threads_io(cluster, scylla_io_threads);
-    cass_cluster_set_queue_size_io(cluster, 81920);
+    cass_cluster_set_queue_size_io(cluster, 1048576);
     if( scylla_username.size() > 0 ) {
       cass_cluster_set_credentials(cluster, scylla_username.c_str(), scylla_password.c_str());
     }
@@ -878,14 +880,19 @@ public:
       boost::posix_time::time_duration diff = now - counter_start_time;
       uint32_t millisecs = diff.total_milliseconds();
 
-      if( millisecs > 1000 ) {
-        ilog("ack ${a}, blocks/s: ${b}, trx/s: ${t}, queue: ${q}",
+      if( millisecs > 5000 ) {
+        ilog("ack ${a}, blocks/s: ${b}, trx/s: ${t}, queue: ${q}, req/s: ${r}",
              ("a", ack)("b", 1000*block_counter/millisecs)("t", 1000*trx_counter/millisecs)
-             ("q", block_track_queue.size()));
+             ("q", block_track_queue.size())
+             ("r", 1000*global_db_req_counter/millisecs));
 
         counter_start_time = now;
         block_counter = 0;
         trx_counter = 0;
+        {
+          std::unique_lock<std::mutex> lock(track_mtx);
+          global_db_req_counter = 0;
+        }
 
         // clean up old entries in the maps
         {
