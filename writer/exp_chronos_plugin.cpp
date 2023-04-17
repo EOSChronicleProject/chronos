@@ -60,6 +60,7 @@ struct block_track_entry {
   uint32_t db_req_counter = 0;
   uint32_t total_trx = 0;
   bool     block_complete = false;
+  uint32_t irreversible = 0;
 
   inline bool is_finished() const {return (block_complete && (trace_jobs_counter + db_req_counter == 0));}
 };
@@ -439,9 +440,11 @@ public:
       ilog("last_written_block: ${b}", ("b", last_written_block));
 
       if( last_written_block > 0 ) { // delete all written data down to the forked block
-        ilog("Deleting data between blocks ${s} and ${e}", ("s", fe->block_num)("e", last_written_block));
+        uint32_t down_to = std::max(fe->block_num, written_irreversible + 1);
+        ilog("Fork: ${f}, written_irreversible: ${i}", ("f", fe->block_num)("i", written_irreversible));
+        ilog("Deleting data between blocks ${s} and ${e}", ("s", down_to)("e", last_written_block));
 
-        while( last_written_block >= fe->block_num && last_written_block > written_irreversible ) {
+        while( last_written_block >= down_to ) {
           statement = cass_prepared_bind(prepared_del_blocks);
           cass_statement_bind_int64(statement, 0, last_written_block);
           future = cass_session_execute(session, statement);
@@ -830,39 +833,18 @@ public:
 
         is_bootstrapping = false;
       }
-
-      if( bf->last_irreversible > written_irreversible ) {
-        uint32_t old_written_irreversible = written_irreversible;
-        if( bf->last_irreversible > bf->block_num ) {
-          // last irreversible is in the future, we are catching up through the old history
-          written_irreversible = bf->block_num;
-        }
-        else {
-          // we are near the head block
-          written_irreversible = bf->last_irreversible;
-        }
-
-        if( written_irreversible > old_written_irreversible ) {
-          CassStatement* statement = cass_prepared_bind(prepared_ins_pointers);
-          size_t pos = 0;
-          cass_statement_bind_int32(statement, pos++, 1); // id=1: irreversible block,
-          cass_statement_bind_int64(statement, pos++, written_irreversible);
-
-          {
-            std::unique_lock<std::mutex> lock(track_mtx);
-            tracker->db_req_counter++;
-          }
-
-          CassFuture* future = cass_session_execute(session, statement);
-          cass_future_set_callback(future, scylla_result_callback, tracker);
-          cass_future_free(future);
-          cass_statement_free(statement);
-        }
-      }
     }
 
     {
       std::unique_lock<std::mutex> lock(track_mtx);
+      if( bf->last_irreversible > bf->block_num ) {
+        // last irreversible is in the future, we are catching up through the old history
+        tracker->irreversible = bf->block_num;
+      }
+      else {
+        // we are near the head block
+        tracker->irreversible = bf->last_irreversible;
+      }
       tracker->block_complete = true;
     }
 
@@ -873,11 +855,13 @@ public:
 
   void ack_finished_blocks() {
     uint32_t ack = 0;
+    uint32_t finished_irreversible = 0;
     uint64_t date_max = 0;
 
     while( !block_track_queue.empty() && block_track_queue.front()->is_finished() ) {
       block_track_entry* tracker = block_track_queue.front().get();
       ack = tracker->block_num;
+      finished_irreversible = tracker->irreversible;
       trx_counter += tracker->total_trx;
       if( date_max < tracker->block_date ) {
         date_max = tracker->block_date;
@@ -905,6 +889,21 @@ public:
         {
           std::unique_lock<std::mutex> lock(track_mtx);
           global_db_req_counter = 0;
+        }
+
+        uint32_t old_written_irreversible = written_irreversible;
+        written_irreversible = finished_irreversible;
+
+        if( written_irreversible > old_written_irreversible ) {
+          CassStatement* statement = cass_prepared_bind(prepared_ins_pointers);
+          size_t pos = 0;
+          cass_statement_bind_int32(statement, pos++, 1); // id=1: irreversible block,
+          cass_statement_bind_int64(statement, pos++, written_irreversible);
+
+          CassFuture* future = cass_session_execute(session, statement);
+          check_future(future, "Updating pointer id=1");
+          cass_future_free(future);
+          cass_statement_free(statement);
         }
 
         // clean up old entries in the maps
