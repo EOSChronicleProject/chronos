@@ -48,6 +48,7 @@ CREATE TABLE transactions
 );
 
 CREATE INDEX transactions_trx_id ON transactions (trx_id);
+CREATE INDEX transactions_seq ON transactions (seq);
 
 
 CREATE TABLE receipts
