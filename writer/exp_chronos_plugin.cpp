@@ -223,7 +223,7 @@ public:
     cass_cluster_set_core_connections_per_host(cluster, scylla_conn_per_host);
     cass_cluster_set_request_timeout(cluster, 100000);
     cass_cluster_set_num_threads_io(cluster, scylla_io_threads);
-    cass_cluster_set_queue_size_io(cluster, 1048576);
+    cass_cluster_set_queue_size_io(cluster, 10485760);
     if( scylla_username.size() > 0 ) {
       cass_cluster_set_credentials(cluster, scylla_username.c_str(), scylla_password.c_str());
     }
