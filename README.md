@@ -74,6 +74,11 @@ speed on the ScyllaDB servers, so theoretically it could be even
 faster. The CPU on ScyllaDB servers was occupied at about 80% during
 the scan.
 
+The average indexing speed was 520 blocks per second in the range of
+blocks 238731156-240618653, storing roughly 50k transactions per
+second in 250k-270k database inserts per second.
+
+
 Storage use:
 
 ```
