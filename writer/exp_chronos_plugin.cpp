@@ -877,9 +877,14 @@ public:
       boost::posix_time::time_duration diff = now - counter_start_time;
       uint32_t millisecs = diff.total_milliseconds();
 
-      if( millisecs > 5000 ) {
+      if( millisecs >= 5000 ) {
+        char buf1[15];
+        snprintf(buf1, 15, "%.1f", 1000.0*block_counter/millisecs);
+        char buf2[15];
+        snprintf(buf2, 15, "%.1f", 1000.0*trx_counter/millisecs);
+
         ilog("ack ${a}, blocks/s: ${b}, trx/s: ${t}, queue: ${q}, req/s: ${r}",
-             ("a", ack)("b", 1000*block_counter/millisecs)("t", 1000*trx_counter/millisecs)
+             ("a", ack)("b", buf1)("t", buf2)
              ("q", block_track_queue.size())
              ("r", 1000*global_db_req_counter/millisecs));
 
