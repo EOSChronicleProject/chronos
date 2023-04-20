@@ -25,7 +25,7 @@ Chronos is implemented as a plugin for
 [Chronicle](https://github.com/EOSChronicleProject/eos-chronicle).
 
 
-## Performance benchmarks
+## Indexing performance benchmarks
 
 
 ### Proton mainnet test
@@ -129,8 +129,83 @@ to such a cheaper server for further processing.
 
 
 
+## Querying benchmarks
+
+The queries were made with the [JavaScript
+client](https://github.com/EOSChronicleProject/chronos-client-npm) in
+the same environment as the full WAX history test. The client was run
+on the same server where the Chronos writer was running.
+
+The JavaScript client that is available for ScyllaDB is designed for
+Cassandra database, and it is not shard-aware. A shard-aware client
+would potentially be faster. Also a lot of CPU processing time is
+spent on the client side to decode the traces, sort them by sequence
+number, and generate the output JSON.
+
+1. Full history of `cc32dninexxx`: 155 transactions in 0.65s.
+
+```
+root@dev01:/opt/src/chronos-client-npm# time node lib/src/util/chronos_cli.js --host=scylla-fi01.dev.binfra.one --dc=hel_dc5 --username=chronos_ro --password=chronos_ro acc --account=cc32dninexxx --maxrows=10000 >/tmp/x
+
+real    0m0.644s
+user    0m0.945s
+sys     0m0.050s
+
+root@dev01:/opt/src/chronos-client-npm# cat /tmp/x | jq | fgrep '"block_num"' | wc
+    155     310    4574
+```
+
+2. Last 1000 transactions of `atomicassets`: 3s
+
+```
+# the script prints many decoding errors, as it fails to decode some action arguments.
+
+root@dev01:/opt/src/chronos-client-npm# time node lib/src/util/chronos_cli.js --host=scylla-fi01.dev.binfra.one --dc=hel_dc5 --username=chronos_ro --password=chronos_ro acc --account=atomicassets --maxrows=1000 >/tmp/x
+
+real    0m2.925s
+user    0m4.289s
+sys     0m0.260s
+```
+
+3. Last 10000 transactions of `atomicassets`: 18.4s
+
+```
+root@dev01:/opt/src/chronos-client-npm# time node lib/src/util/chronos_cli.js --host=scylla-fi01.dev.binfra.one --dc=hel_dc5 --username=chronos_ro --password=chronos_ro acc --account=atomicassets --maxrows=10000 >/tmp/x
+
+real    0m18.315s
+user    0m24.493s
+sys     0m1.289s
+
+root@dev01:/opt/src/chronos-client-npm# cat /tmp/x | jq | fgrep '"block_num"' | wc
+  10000   20000  300000
+```
+
+4. Last 10000 transactions for `m.federation`: 4.5s
+
+```
+root@dev01:/opt/src/chronos-client-npm# time node lib/src/util/chronos_cli.js --host=scylla-fi01.dev.binfra.one --dc=hel_dc5 --username=chronos_ro --password=chronos_ro acc --account=m.federation --maxrows=10000 >/tmp/x
+
+real    0m4.547s
+user    0m6.322s
+sys     0m0.347s
+
+root@dev01:/opt/src/chronos-client-npm# cat /tmp/x | jq | fgrep '"block_num"' | wc
+  10000   20000  300000
+```
 
 
+5. Last 10000 transactions for `atomicmarket`: 27.7s
+
+```
+root@dev01:/opt/src/chronos-client-npm# time node lib/src/util/chronos_cli.js --host=scylla-fi01.dev.binfra.one --dc=hel_dc5 --username=chronos_ro --password=chronos_ro acc --account=atomicmarket --maxrows=10000 >/tmp/x
+
+real    0m27.658s
+user    0m38.654s
+sys     0m1.921s
+
+root@dev01:/opt/src/chronos-client-npm# cat /tmp/x | jq | fgrep '"block_num"' | wc
+  10000   20000  300000
+```
 
 
 # License and copyright
