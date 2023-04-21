@@ -99,6 +99,42 @@ full Hyperion server uses 22.5TB of storage as of today.
 
 
 
+### WAX test with 3x replication
+
+The server hardware as above, but the keyspace is configured with
+replication factor 3.
+
+The average indexing speed for blocks 203282164-197982619 was 245
+blocks per second, storing approximately 20-25k transactions per
+second, using approxiomately 180k database inserts per second.
+
+Also, running on a single server with replication factor 1 resulted in
+approximately the same performance.
+
+
+### WAX test with remote writer
+
+Previous tests were made within the same datacenter (Hetzner
+Helsinki). If the writer and the ScylaDB servers are in different
+datacenters, the performance degrades a lot. In this test, the
+ScyllaDB was on a server in Germany (25ms round-trip ping).
+
+It is still possible to load the ScyllaDB Server CPU and storage I/O
+with the work, but the writer needs to execute certain tasks
+synchronously, and they slow down the whole process a lot. For
+example, on receiving a fork event from the blockchain, the server
+needs to delete a few blocks from the database. 25ms delay is slowing
+down such tasks a lot.
+
+
+### Server CPU performance
+
+While processing the past histiory, the Chronos writer is able to
+fully load the CPU on the ScyllaDB servers. In this regard, the number
+of cores plays a significant role. For example, an 16-core AMD Ryzen 9
+5950X allowed for about 40% faster processing than a 8-core Intel Xeon
+W-2145.
+
 
 
 ### WAX test with HDD storage
