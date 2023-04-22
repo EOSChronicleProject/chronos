@@ -773,6 +773,11 @@ public:
 
 
   void on_receiver_pause(std::shared_ptr<chronicle::channels::receiver_pause> rp) {
+    if( is_exiting ) {
+      abort_receiver();
+      return;
+    }
+
     ack_finished_blocks();
   }
 
@@ -948,7 +953,7 @@ void exp_chronos_plugin::set_program_options( options_description& cli, options_
     (SCYLLA_USERNAME_OPT, bpo::value<string>(), "ScyllaDB authentication name")
     (SCYLLA_PASSWORD_OPT, bpo::value<string>(), "ScyllaDB authentication password")
     (SCYLLA_CONSISTENCY_OPT, bpo::value<uint16_t>()->default_value(CASS_CONSISTENCY_QUORUM), "Cluster consistency level")
-    (CHRONOS_MAXUNACK_OPT, bpo::value<uint32_t>()->default_value(1000),
+    (CHRONOS_MAXUNACK_OPT, bpo::value<uint32_t>()->default_value(500),
      "Receiver will pause at so many unacknowledged blocks")
     (CHRONOS_TRACE_THREADS_OPT, bpo::value<uint16_t>()->default_value(4), "Number of trace processing threads")
     ;
