@@ -63,7 +63,7 @@ Also, the full Proton
 database on Postgres, using ZFS compression, occupies 563 GB.
 
 
-### Full WAX mainet test
+### Full WAX mainnet test
 
 The same test environment as above, and the keyspace is configured
 with `replication_factor: 1`.
@@ -161,6 +161,28 @@ Overall, such a server would be alright for a database that does not
 need too much of catching up. It would probably make sense to scan the
 blockchain on a faster and more expensive server, and clone ScyllaDB
 to such a cheaper server for further processing.
+
+
+### WAX test with low-cost hardware
+
+In this test, we used 6 lowest-cost batemetal servers at Hetzner:
+6-Core AMD Ryzen 5 3600, 64GB non-ECC RAM, 2x 480GB NVME drives. The
+NVME drives were configured for RAID0 arrays and XFS filesystem.
+
+One of the servers was rebooting every few hours, probably due to
+faulty RAM. This allowed for testing the ScyllaDB resiliency.
+
+With redundancy factor 3, the average writing speed was 169 blocks per
+second in the range 228642204-226811517, sporting about 100k inserts
+per second.
+
+With redundancy factor 2, the average speed was 205 blocks per second.
+
+With redundancy factor 1, the average speed was 364 blocks per second.
+
+When one of the server crashed, it took about an hour until it
+restored the operation.
+
 
 
 
