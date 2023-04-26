@@ -25,7 +25,7 @@ Chronos is implemented as a plugin for
 [Chronicle](https://github.com/EOSChronicleProject/eos-chronicle).
 
 
-## Indexing performance benchmarks
+## Indexing performance benchmarks (with all traces)
 
 
 ### Proton mainnet test
@@ -184,6 +184,10 @@ When one of the server crashed, it took about an hour until it
 restored the operation.
 
 
+## Indexing performance (without all traces)
+
+On the low-cost hardware cluster described above, if traces are not
+stored, the writer is about 25% faster.
 
 
 

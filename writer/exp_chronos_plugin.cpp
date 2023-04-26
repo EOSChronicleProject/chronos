@@ -35,6 +35,8 @@ namespace {
 
   const char* CHRONOS_MAXUNACK_OPT = "chronos-max-unack";
   const char* CHRONOS_TRACE_THREADS_OPT = "chronos-trace-threads";
+  const char* CHRONOS_STORE_ALL_TRACES_OPT = "chronos-store-all-traces";
+  const char* CHRONOS_STORE_TRACES_BLK_OPT = "chronos-store-traces-blocks-back";
 
   const uint64_t MILLISECONDS_IN_A_DAY = 24 * 3600 * 1000;
 }
@@ -59,10 +61,16 @@ struct block_track_entry {
   uint32_t trace_jobs_counter = 0;
   uint32_t db_req_counter = 0;
   uint32_t total_trx = 0;
+  bool     store_traces = false;
   bool     block_complete = false;
   uint32_t irreversible = 0;
 
   inline bool is_finished() const {return (block_complete && (trace_jobs_counter + db_req_counter == 0));}
+
+  inline void inc_db_req_counter() {
+    std::unique_lock<std::mutex> lock(track_mtx);
+    db_req_counter++;
+  }
 };
 
 
@@ -94,6 +102,7 @@ void scylla_result_callback(CassFuture* future, void* data)
 struct trace_job {
   std::shared_ptr<block_track_entry>                      tracker;
   std::shared_ptr<chronicle::channels::transaction_trace> ccttr;
+  uint32_t                                                block_pos;
 };
 
 
@@ -119,7 +128,10 @@ public:
   string scylla_password;
   CassConsistency scylla_consistency;
 
-  uint32_t maxunack;
+  uint32_t  maxunack;
+  size_t    trace_threads;
+  bool      store_all_traces;
+  int32_t   store_traces_blk;
 
   CassCluster* cluster;
   CassSession* session;
@@ -129,6 +141,7 @@ public:
   const CassPrepared* prepared_ins_pointers;
   const CassPrepared* prepared_ins_blocks;
   const CassPrepared* prepared_ins_transactions;
+  const CassPrepared* prepared_ins_traces;
   const CassPrepared* prepared_ins_receipts;
   const CassPrepared* prepared_ins_receipt_dates;
   const CassPrepared* prepared_ins_actions;
@@ -137,6 +150,7 @@ public:
 
   const CassPrepared* prepared_del_blocks;
   const CassPrepared* prepared_del_transactions;
+  const CassPrepared* prepared_del_traces;
   const CassPrepared* prepared_del_receipts;
   const CassPrepared* prepared_del_actions;
   const CassPrepared* prepared_del_abi_history;
@@ -153,7 +167,6 @@ public:
 
   std::queue<std::shared_ptr<block_track_entry>>        block_track_queue;
 
-  size_t                             trace_treads;
   boost::thread_group                traces_thread_group;
   boost::asio::io_context            traces_io_context;
   boost::asio::executor_work_guard<boost::asio::io_context::executor_type> traces_worker;
@@ -161,6 +174,8 @@ public:
   boost::asio::deadline_timer        fork_pause_timer;
 
   uint32_t written_irreversible = 0;
+  bool     do_store_traces = false;
+  uint32_t store_traces_first_block = 0;
 
   uint32_t trx_counter = 0;
   uint32_t block_counter = 0;
@@ -174,6 +189,10 @@ public:
   void start() {
     std::atexit(atexit_handler);
     exporter_will_ack_blocks(maxunack);
+
+    if( store_all_traces ) {
+      do_store_traces = true;
+    }
 
     _forks_subscription =
       app().get_channel<chronicle::channels::forks>().subscribe
@@ -269,6 +288,29 @@ public:
     }
 
 
+    {
+      // id=3: lowest block where traces are populated
+      CassStatement* statement = cass_statement_new("SELECT ptr FROM pointers WHERE id=3", 0);
+      future = cass_session_execute(session, statement);
+      check_future(future, "quering pointers");
+      const CassResult* result = cass_future_get_result(future);
+      if( cass_result_row_count(result) > 0 ) {
+        const CassRow* row = cass_result_first_row(result);
+        const CassValue* column1 = cass_row_get_column(row, 0);
+        int64_t val;
+        cass_value_get_int64(column1,  &val);
+        if( val > 0 ) {
+          store_traces_first_block = (uint32_t) val;
+          do_store_traces = 1;
+          ilog("Database contains traces startig form block ${b}", ("b", store_traces_first_block));
+        }
+      }
+      cass_result_free(result);
+      cass_statement_free(statement);
+      cass_future_free(future);
+    }
+
+
     future = cass_session_prepare
       (session, "INSERT INTO pointers (id, ptr) VALUES (?,?) USING TIMEOUT 100s");
     check_future(future, "preparing ins_pointers");
@@ -284,11 +326,16 @@ public:
 
 
     future = cass_session_prepare
-      (session, "INSERT INTO transactions (block_num, block_time, seq, trx_id, trace) VALUES (?,?,?,?,?) USING TIMEOUT 100s");
+      (session, "INSERT INTO transactions (block_num, block_time, seq, block_pos, trx_id) VALUES (?,?,?,?,?) USING TIMEOUT 100s");
     check_future(future, "preparing ins_transactions");
     prepared_ins_transactions = cass_future_get_prepared(future);
     cass_future_free(future);
 
+    future = cass_session_prepare
+      (session, "INSERT INTO traces (block_num, seq, trace) VALUES (?,?,?) USING TIMEOUT 100s");
+    check_future(future, "preparing ins_traces");
+    prepared_ins_traces = cass_future_get_prepared(future);
+    cass_future_free(future);
 
     future = cass_session_prepare
       (session,
@@ -338,6 +385,11 @@ public:
     prepared_del_transactions = cass_future_get_prepared(future);
     cass_future_free(future);
 
+    future = cass_session_prepare(session, "DELETE FROM traces USING TIMEOUT 100s WHERE block_num=?");
+    check_future(future, "preparing del_traces");
+    prepared_del_traces = cass_future_get_prepared(future);
+    cass_future_free(future);
+
     future = cass_session_prepare(session, "DELETE FROM receipts USING TIMEOUT 100s WHERE block_num=?");
     check_future(future, "preparing del_receipts");
     prepared_del_receipts = cass_future_get_prepared(future);
@@ -375,7 +427,7 @@ public:
       ilog("Wrote ${c} abi_history rows", ("c",count));
     }
 
-    for(size_t i=0; i < trace_treads; ++i) {
+    for(size_t i=0; i < trace_threads; ++i) {
       traces_thread_group.create_thread(boost::bind(&boost::asio::io_context::run, &traces_io_context));
     }
 
@@ -459,6 +511,13 @@ public:
           cass_future_free(future);
           cass_statement_free(statement);
 
+          statement = cass_prepared_bind(prepared_del_traces);
+          cass_statement_bind_int64(statement, 0, last_written_block);
+          future = cass_session_execute(session, statement);
+          check_future(future, "deleting forked traces");
+          cass_future_free(future);
+          cass_statement_free(statement);
+
           statement = cass_prepared_bind(prepared_del_receipts);
           cass_statement_bind_int64(statement, 0, last_written_block);
           future = cass_session_execute(session, statement);
@@ -503,7 +562,6 @@ public:
     tracker_ptr->block_num = bb->block_num;
     tracker_ptr->block_timestamp = block_timestamp;
     tracker_ptr->block_date = block_date;
-    block_track_queue.push(tracker_ptr);
 
     if( bb->block_num > written_irreversible ) {
       tracker_ptr->db_req_counter = 1;
@@ -520,6 +578,28 @@ public:
       cass_future_free(future);
       cass_statement_free(statement);
     }
+
+    if( do_store_traces ) {
+      tracker_ptr->store_traces = true;
+    }
+    else {
+      if( store_traces_blk != 0 && bb->block_num >= bb->last_irreversible - store_traces_blk ) {
+        do_store_traces = true;
+        tracker_ptr->store_traces = true;
+
+        CassStatement* statement = cass_prepared_bind(prepared_ins_pointers);
+        size_t pos = 0;
+        cass_statement_bind_int32(statement, pos++, 3); // id=3: lowest block where traces are populated
+        cass_statement_bind_int64(statement, pos++, bb->block_num);
+
+        CassFuture* future = cass_session_execute(session, statement);
+        check_future(future, "Updating pointer id=3");
+        cass_future_free(future);
+        cass_statement_free(statement);
+      }
+    }
+
+    block_track_queue.push(tracker_ptr);
   }
 
 
@@ -541,16 +621,17 @@ public:
       throw std::runtime_error("tracker block is not the same as trace block");
     }
 
+    auto job = make_shared<trace_job>();
+    trace_job* job_entry = job.get();
+    job_entry->tracker = tracker_ptr;
+    job_entry->ccttr = ccttr;
+    job_entry->block_pos = tracker->total_trx;
+
     {
       std::unique_lock<std::mutex> lock(track_jobs_counter_mtx);
       tracker->trace_jobs_counter++;
       tracker->total_trx++;
     }
-
-    auto job = make_shared<trace_job>();
-    trace_job* job_entry = job.get();
-    job_entry->tracker = tracker_ptr;
-    job_entry->ccttr = ccttr;
 
     traces_io_context.post(boost::bind(&exp_chronos_plugin_impl::process_transaction_trace, this, job));
   }
@@ -630,13 +711,25 @@ public:
       cass_statement_bind_int64(statement, pos++, block_num);
       cass_statement_bind_int64(statement, pos++, block_timestamp);
       cass_statement_bind_int64(statement, pos++, global_seq);
+      cass_statement_bind_int32(statement, pos++, job->block_pos);
       cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)trx_id.data(), trx_id.size());
+
+      tracker->inc_db_req_counter();
+
+      CassFuture* future = cass_session_execute(session, statement);
+      cass_future_set_callback(future, scylla_result_callback, tracker);
+      cass_future_free(future);
+      cass_statement_free(statement);
+    }
+
+    if( tracker->store_traces ) {
+      CassStatement* statement = cass_prepared_bind(prepared_ins_traces);
+      size_t pos = 0;
+      cass_statement_bind_int64(statement, pos++, block_num);
+      cass_statement_bind_int64(statement, pos++, global_seq);
       cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)job->ccttr->bin_start, job->ccttr->bin_size);
 
-      {
-        std::unique_lock<std::mutex> lock(track_mtx);
-        tracker->db_req_counter++;
-      }
+      tracker->inc_db_req_counter();
 
       CassFuture* future = cass_session_execute(session, statement);
       cass_future_set_callback(future, scylla_result_callback, tracker);
@@ -656,10 +749,7 @@ public:
         cass_statement_bind_int64(statement, pos++, item.second);
         cass_statement_bind_int64(statement, pos++, recv_seq_max.at(item.first) - item.second + 1);
 
-        {
-          std::unique_lock<std::mutex> lock(track_mtx);
-          tracker->db_req_counter++;
-        }
+        tracker->inc_db_req_counter();
 
         CassFuture* future = cass_session_execute(session, statement);
         cass_future_set_callback(future, scylla_result_callback, tracker);
@@ -677,10 +767,7 @@ public:
         cass_statement_bind_string(statement, pos++, eosio::name_to_string(item.first).c_str());
         cass_statement_bind_int64(statement, pos++, block_date);
 
-        {
-          std::unique_lock<std::mutex> lock(track_mtx);
-          tracker->db_req_counter++;
-        }
+        tracker->inc_db_req_counter();
 
         CassFuture* future = cass_session_execute(session, statement);
         cass_future_set_callback(future, scylla_result_callback, tracker);
@@ -701,10 +788,7 @@ public:
           cass_statement_bind_string(statement, pos++, eosio::name_to_string(item.first).c_str());
           cass_statement_bind_string(statement, pos++, eosio::name_to_string(aname).c_str());
 
-          {
-            std::unique_lock<std::mutex> lock(track_mtx);
-            tracker->db_req_counter++;
-          }
+          tracker->inc_db_req_counter();
 
           CassFuture* future = cass_session_execute(session, statement);
           cass_future_set_callback(future, scylla_result_callback, tracker);
@@ -723,10 +807,7 @@ public:
           cass_statement_bind_string(statement, pos++, eosio::name_to_string(aname).c_str());
           cass_statement_bind_int64(statement, pos++, block_date);
 
-          {
-            std::unique_lock<std::mutex> lock(track_mtx);
-            tracker->db_req_counter++;
-          }
+          tracker->inc_db_req_counter();
 
           CassFuture* future = cass_session_execute(session, statement);
           cass_future_set_callback(future, scylla_result_callback, tracker);
@@ -809,10 +890,7 @@ public:
         cass_statement_bind_bytes(statement, pos++, (cass_byte_t*)action_mroot.data(), action_mroot.size());
         cass_statement_bind_int32(statement, pos++, bf->trx_count);
 
-        {
-          std::unique_lock<std::mutex> lock(track_mtx);
-          tracker->db_req_counter++;
-        }
+        tracker->inc_db_req_counter();
 
         CassFuture* future = cass_session_execute(session, statement);
         cass_future_set_callback(future, scylla_result_callback, tracker);
@@ -826,10 +904,7 @@ public:
         cass_statement_bind_int32(statement, pos++, 2); // id=2: lowest block in history
         cass_statement_bind_int64(statement, pos++, bf->block_num);
 
-        {
-          std::unique_lock<std::mutex> lock(track_mtx);
-          tracker->db_req_counter++;
-        }
+        tracker->inc_db_req_counter();
 
         CassFuture* future = cass_session_execute(session, statement);
         cass_future_set_callback(future, scylla_result_callback, tracker);
@@ -956,6 +1031,8 @@ void exp_chronos_plugin::set_program_options( options_description& cli, options_
     (CHRONOS_MAXUNACK_OPT, bpo::value<uint32_t>()->default_value(500),
      "Receiver will pause at so many unacknowledged blocks")
     (CHRONOS_TRACE_THREADS_OPT, bpo::value<uint16_t>()->default_value(4), "Number of trace processing threads")
+    (CHRONOS_STORE_ALL_TRACES_OPT, bpo::value<bool>()->default_value(true), "Store traces for all blocks")
+    (CHRONOS_STORE_TRACES_BLK_OPT, bpo::value<uint32_t>()->default_value(10000000), "Blocks depth to store transaction traces")
     ;
 }
 
@@ -998,9 +1075,12 @@ void exp_chronos_plugin::plugin_initialize( const variables_map& options ) {
     if( my->maxunack == 0 )
       throw std::runtime_error("Maximum unacked blocks must be a positive integer");
 
-    my->trace_treads = options.at(CHRONOS_TRACE_THREADS_OPT).as<uint16_t>();
-    if( my->trace_treads == 0 )
+    my->trace_threads = options.at(CHRONOS_TRACE_THREADS_OPT).as<uint16_t>();
+    if( my->trace_threads == 0 )
       throw std::runtime_error("Maximum threads must be a positive integer");
+
+    my->store_all_traces = options.at(CHRONOS_STORE_ALL_TRACES_OPT).as<bool>();
+    my->store_traces_blk = options.at(CHRONOS_STORE_TRACES_BLK_OPT).as<uint32_t>();
 
     if( opt_missing )
       throw std::runtime_error("Mandatory option missing");

@@ -6,6 +6,8 @@
    id=0: last written block,
    id=1: irreversible block,
    id=2: lowest block in history,
+   id=3: lowest block where traces are populated
+   if=4: lowest block for traces scheduled for deletion
 */
 CREATE TABLE pointers
 (
@@ -14,6 +16,8 @@ CREATE TABLE pointers
 );
 
 
+/* block attributes.
+   block_date is a start of a 24h day, in milliseconds, in UTC zone */
 CREATE TABLE blocks
 (
  block_num         BIGINT,
@@ -37,13 +41,16 @@ CREATE MATERIALIZED VIEW block_by_date AS
     PRIMARY KEY (block_date, block_num);
 
 
+/* transaction index.
+   seq is the first global sequence number of the first action receipt.
+   trx_id is a 256-bit byte array */
 CREATE TABLE transactions
 (
  block_num         BIGINT,
  block_time        TIMESTAMP,
  seq               BIGINT,
+ block_pos         INT,     /* position inside the block */
  trx_id            BLOB,
- trace             BLOB,
  PRIMARY KEY (block_num, seq)
 );
 
@@ -51,6 +58,19 @@ CREATE INDEX transactions_trx_id ON transactions (trx_id);
 CREATE INDEX transactions_seq ON transactions (seq);
 
 
+/* binary traces from state history. The writer may only choose to
+   write traces for the last few million blocks */
+CREATE TABLE traces
+(
+ block_num         BIGINT,
+ seq               BIGINT,
+ trace             BLOB,
+ PRIMARY KEY (block_num, seq)
+);
+
+
+/* transaction receipts: every account involved in a transaction and relevant
+   range of recv_sequence for each account */
 CREATE TABLE receipts
 (
  block_num              BIGINT,
@@ -71,6 +91,8 @@ CREATE MATERIALIZED VIEW account_receipts AS
     PRIMARY KEY ((account_name, block_date), recv_sequence_start, seq, block_num);
 
 
+/* as the account_receipts view has block_date in partitioning key,
+   this table indexes the dates where an account has any transactions */
 CREATE TABLE receipt_dates
 (
  account_name           ASCII,
@@ -80,6 +102,7 @@ CREATE TABLE receipt_dates
 
 
 
+/* index of transactions for each contract and action */
 CREATE TABLE actions
 (
  block_num         BIGINT,
@@ -98,7 +121,7 @@ CREATE MATERIALIZED VIEW contract_actions AS
     WHERE  contract IS NOT NULL AND block_date IS NOT NULL AND action IS NOT NULL AND seq IS NOT NULL
     PRIMARY KEY ((contract, block_date), action, block_num, seq);
 
-
+/* dates where each (contract, action) tuple has a transaction */
 CREATE TABLE action_dates
 (
  contract               ASCII,
@@ -110,7 +133,7 @@ CREATE TABLE action_dates
 
 
 
-
+/* ABI for each contract, in binary form */
 CREATE TABLE abi_history
 (
  block_num              BIGINT,
