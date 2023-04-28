@@ -1,10 +1,16 @@
-apt update && apt install -y libuv1 openssl libssl-dev zlib1g
+apt update && apt install -y libuv1 openssl libssl-dev zlib1g 
 
 cd /var/local
+
+# Ubuntu 22.04:
+wget http://archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2_amd64.deb
+apt install ./libssl1.1_1.1.1f-1ubuntu2_amd64.deb 
+
 wget https://github.com/scylladb/cpp-driver/releases/download/2.16.2b/scylla-cpp-driver_2.16.2.b-1_amd64.deb
 wget https://github.com/scylladb/cpp-driver/releases/download/2.16.2b/scylla-cpp-driver-dev_2.16.2.b-1_amd64.deb
 apt install ./scylla-cpp-driver*
 
+./external/chronicle/pinned_build/install_deps.sh
+./chronos_pinned_build.sh /opt/src/chronicle-deps /opt/src/chronos/build $(nproc)
 
-MORE_CMAKE_FLAGS="-DCHRONICLE_RECEIVER_NAME=chronos-writer -DCHRONICLE_RECEIVER_ADDITIONAL_PLUGINS=/opt/src/chronos/writer -DCHRONICLE_JSON_EXPORT=FALSE -DPACKAGE_NAME=chronos -DPACKAGE_VERSION=1.0" nice ./pinned_build/chronicle_pinned_build.sh /opt/src/chronicle-deps /opt/src/chronos/build $(nproc)
 
