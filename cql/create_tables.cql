@@ -68,10 +68,11 @@ CREATE TABLE receipts
  block_time             TIMESTAMP,
  block_date             BIGINT,
  seq                    BIGINT,
- account_name           ASCII,
- recv_sequence_start    BIGINT,
- recv_sequence_count    BIGINT,
- PRIMARY KEY (block_num, seq, account_name, block_date)
+ receiver               ASCII,
+ contract               ASCII,
+ action                 ASCII,
+ recv_sequence          BIGINT,
+ PRIMARY KEY (block_num, seq, receiver, recv_sequence, contract, action)
 );
 
 
@@ -79,35 +80,12 @@ CREATE TABLE receipts
    this table indexes the dates where an account has any transactions */
 CREATE TABLE receipt_dates
 (
- account_name           ASCII,
+ receiver               ASCII,
  block_date             BIGINT,
- PRIMARY KEY (account_name, block_date)
+ PRIMARY KEY (receiver, block_date)
 );
 
 
-
-/* index of transactions for each contract and action */
-CREATE TABLE actions
-(
- block_num         BIGINT,
- block_time        TIMESTAMP,
- block_date        BIGINT,
- seq               BIGINT,
- contract          ASCII,
- action            ASCII,
- account_name      ASCII, /* receipt recipient */
- PRIMARY KEY (block_num, seq, contract, action, account_name)
-);
-
-
-/* dates where each (contract, action) tuple has a transaction */
-CREATE TABLE action_dates
-(
- contract               ASCII,
- action                 ASCII,
- block_date             BIGINT,
- PRIMARY KEY ((contract, action), block_date)
-);
 
 
 
@@ -116,7 +94,7 @@ CREATE TABLE action_dates
 CREATE TABLE abi_history
 (
  block_num              BIGINT,
- account_name           ASCII,
+ contract               ASCII,
  abi_raw                BLOB,
- PRIMARY KEY (block_num, account_name)
+ PRIMARY KEY (block_num, contract)
 );

@@ -17,32 +17,26 @@ CREATE INDEX transactions_seq ON transactions (seq);
 CREATE MATERIALIZED VIEW account_receipts AS
     SELECT *
     FROM receipts
-    WHERE account_name IS NOT NULL AND block_date IS NOT NULL AND recv_sequence_start IS NOT NULL AND seq IS NOT NULL
-    PRIMARY KEY ((account_name, block_date), recv_sequence_start, seq, block_num);
+    WHERE block_num IS NOT NULL AND seq IS NOT NULL AND receiver IS NOT NULL AND
+          recv_sequence IS NOT NULL AND contract IS NOT NULL AND action IS NOT NULL AND block_date IS NOT NULL
+    PRIMARY KEY ((receiver, block_date), recv_sequence, seq, block_num, contract, action);
 
 
-
-
-CREATE MATERIALIZED VIEW contract_actions AS
+CREATE MATERIALIZED VIEW action_receipts AS
     SELECT *
-    FROM actions
-    WHERE contract IS NOT NULL AND block_date IS NOT NULL AND action IS NOT NULL AND seq IS NOT NULL AND account_name IS NOT NULL
-    PRIMARY KEY ((contract, block_date), action, block_num, seq, account_name);
+    FROM receipts
+    WHERE block_num IS NOT NULL AND seq IS NOT NULL AND receiver IS NOT NULL AND
+          recv_sequence IS NOT NULL AND contract IS NOT NULL AND action IS NOT NULL AND block_date IS NOT NULL
+    PRIMARY KEY ((receiver, contract, action, block_date), recv_sequence, seq, block_num);
 
 
-
-CREATE MATERIALIZED VIEW account_contract_actions AS
-    SELECT *
-    FROM actions
-    WHERE  contract IS NOT NULL AND block_date IS NOT NULL AND action IS NOT NULL AND seq IS NOT NULL AND account_name IS NOT NULL
-    PRIMARY KEY ((account_name, block_date), contract, action, block_num, seq);
 
 
 
 
 CREATE MATERIALIZED VIEW abi_by_account AS
-    SELECT account_name, block_num, abi_raw
+    SELECT contract, block_num, abi_raw
     FROM abi_history
-    WHERE account_name IS NOT NULL
-    PRIMARY KEY (account_name, block_num)
+    WHERE contract IS NOT NULL
+    PRIMARY KEY (contract, block_num)
     WITH CLUSTERING ORDER BY (block_num DESC);

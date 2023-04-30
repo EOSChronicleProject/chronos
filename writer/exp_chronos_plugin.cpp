@@ -144,15 +144,12 @@ public:
   const CassPrepared* prepared_ins_traces;
   const CassPrepared* prepared_ins_receipts;
   const CassPrepared* prepared_ins_receipt_dates;
-  const CassPrepared* prepared_ins_actions;
-  const CassPrepared* prepared_ins_action_dates;
   const CassPrepared* prepared_ins_abi_history;
 
   const CassPrepared* prepared_del_blocks;
   const CassPrepared* prepared_del_transactions;
   const CassPrepared* prepared_del_traces;
   const CassPrepared* prepared_del_receipts;
-  const CassPrepared* prepared_del_actions;
   const CassPrepared* prepared_del_abi_history;
 
   chronicle::channels::forks::channel_type::handle               _forks_subscription;
@@ -183,9 +180,8 @@ public:
   boost::posix_time::ptime counter_start_time;
 
   // map keys are block dates currently in the processing queue
-  std::mutex date_maps_mtx;
-  std::map<uint64_t, std::set<uint64_t>>                     receipt_date_written;
-  std::map<uint64_t, std::map<uint64_t, std::set<uint64_t>>> action_date_written;
+  std::mutex                               date_maps_mtx;
+  std::map<uint64_t, std::set<uint64_t>>   receipt_date_written;
 
   void start() {
     std::atexit(atexit_handler);
@@ -341,37 +337,20 @@ public:
 
     future = cass_session_prepare
       (session,
-       "INSERT INTO receipts (block_num, block_time, block_date, seq, account_name, recv_sequence_start, recv_sequence_count) VALUES (?,?,?,?,?,?,?) USING TIMEOUT 100s");
+       "INSERT INTO receipts (block_num, block_time, block_date, seq, receiver, contract, action, recv_sequence) VALUES (?,?,?,?,?,?,?,?) USING TIMEOUT 100s");
     check_future(future, "preparing ins_receipts");
     prepared_ins_receipts = cass_future_get_prepared(future);
     cass_future_free(future);
 
-
     future = cass_session_prepare
       (session,
-       "INSERT INTO receipt_dates (account_name, block_date) VALUES (?,?) USING TIMEOUT 100s");
+       "INSERT INTO receipt_dates (receiver, block_date) VALUES (?,?) USING TIMEOUT 100s");
     check_future(future, "preparing ins_receipt_dates");
     prepared_ins_receipt_dates = cass_future_get_prepared(future);
     cass_future_free(future);
 
-
     future = cass_session_prepare
-      (session, "INSERT INTO actions (block_num, block_time, block_date, seq, contract, action, account_name) VALUES (?,?,?,?,?,?,?) USING TIMEOUT 100s");
-    check_future(future, "preparing ins_actions");
-    prepared_ins_actions = cass_future_get_prepared(future);
-    cass_future_free(future);
-
-
-    future = cass_session_prepare
-      (session,
-       "INSERT INTO action_dates (contract, action, block_date) VALUES (?,?,?) USING TIMEOUT 100s");
-    check_future(future, "preparing ins_action_dates");
-    prepared_ins_action_dates = cass_future_get_prepared(future);
-    cass_future_free(future);
-
-
-    future = cass_session_prepare
-      (session, "INSERT INTO abi_history (block_num, account_name, abi_raw) VALUES (?,?,?) USING TIMEOUT 100s");
+      (session, "INSERT INTO abi_history (block_num, contract, abi_raw) VALUES (?,?,?) USING TIMEOUT 100s");
     check_future(future, "preparing ins_abi_history");
     prepared_ins_abi_history = cass_future_get_prepared(future);
     cass_future_free(future);
@@ -395,11 +374,6 @@ public:
     future = cass_session_prepare(session, "DELETE FROM receipts USING TIMEOUT 100s WHERE block_num=?");
     check_future(future, "preparing del_receipts");
     prepared_del_receipts = cass_future_get_prepared(future);
-    cass_future_free(future);
-
-    future = cass_session_prepare(session, "DELETE FROM actions USING TIMEOUT 100s WHERE block_num=?");
-    check_future(future, "preparing del_actions");
-    prepared_del_actions = cass_future_get_prepared(future);
     cass_future_free(future);
 
     future = cass_session_prepare(session, "DELETE FROM abi_history USING TIMEOUT 100s WHERE block_num=?");
@@ -527,13 +501,6 @@ public:
           cass_future_free(future);
           cass_statement_free(statement);
 
-          statement = cass_prepared_bind(prepared_del_actions);
-          cass_statement_bind_int64(statement, 0, last_written_block);
-          future = cass_session_execute(session, statement);
-          check_future(future, "deleting forked actions");
-          cass_future_free(future);
-          cass_statement_free(statement);
-
           statement = cass_prepared_bind(prepared_del_abi_history);
           cass_statement_bind_int64(statement, 0, last_written_block);
           future = cass_session_execute(session, statement);
@@ -655,12 +622,14 @@ public:
       return;
     }
 
+    block_track_entry* tracker = job->tracker.get();
+    uint32_t block_num = tracker->block_num;
+    uint64_t block_timestamp = tracker->block_timestamp;
+    uint64_t block_date = tracker->block_date;
+
     auto& trace = std::get<eosio::ship_protocol::transaction_trace_v0>(job->ccttr->trace);
 
-    uint64_t                                  global_seq = 0;
-    std::map<uint64_t, uint64_t>              recv_seq_start;
-    std::map<uint64_t, uint64_t>              recv_seq_max;
-    std::map<uint64_t, std::map<uint64_t, std::set<uint64_t>>>    actions_seen;
+    uint64_t global_seq = 0;
 
     for( auto& atrace: trace.action_traces ) {
 
@@ -695,13 +664,44 @@ public:
         global_seq = receipt->global_sequence;
       }
 
-      if( recv_seq_start.count(receiver.value) == 0 ) {
-        recv_seq_start.insert_or_assign(receiver.value, receipt->recv_sequence);
+
+      {
+        CassStatement* statement = cass_prepared_bind(prepared_ins_receipts);
+        size_t pos = 0;
+        cass_statement_bind_int64(statement, pos++, block_num);
+        cass_statement_bind_int64(statement, pos++, block_timestamp);
+        cass_statement_bind_int64(statement, pos++, block_date);
+        cass_statement_bind_int64(statement, pos++, global_seq);
+        cass_statement_bind_string(statement, pos++, eosio::name_to_string(receiver.value).c_str());
+        cass_statement_bind_string(statement, pos++, eosio::name_to_string(act->account.value).c_str());
+        cass_statement_bind_string(statement, pos++, eosio::name_to_string(act->name.value).c_str());
+        cass_statement_bind_int64(statement, pos++, receipt->recv_sequence);
+
+        tracker->inc_db_req_counter();
+
+        CassFuture* future = cass_session_execute(session, statement);
+        cass_future_set_callback(future, scylla_result_callback, tracker);
+        cass_future_free(future);
+        cass_statement_free(statement);
       }
 
-      recv_seq_max.insert_or_assign(receiver.value, receipt->recv_sequence);
+      std::unique_lock<std::mutex> lock(date_maps_mtx);
+      if( receipt_date_written[block_date].count(receiver.value) == 0 )
+      {
+        receipt_date_written[block_date].insert(receiver.value);
 
-      actions_seen[act->account.value][act->name.value].insert(receiver.value);
+        CassStatement* statement = cass_prepared_bind(prepared_ins_receipt_dates);
+        size_t pos = 0;
+        cass_statement_bind_string(statement, pos++, eosio::name_to_string(receiver.value).c_str());
+        cass_statement_bind_int64(statement, pos++, block_date);
+
+        tracker->inc_db_req_counter();
+
+        CassFuture* future = cass_session_execute(session, statement);
+        cass_future_set_callback(future, scylla_result_callback, tracker);
+        cass_future_free(future);
+        cass_statement_free(statement);
+      }
     }
 
     if( global_seq == 0 ) {
@@ -709,11 +709,6 @@ public:
     }
 
     const std::array<uint8_t,32>& trx_id = trace.id.extract_as_byte_array();
-
-    block_track_entry* tracker = job->tracker.get();
-    uint32_t block_num = tracker->block_num;
-    uint64_t block_timestamp = tracker->block_timestamp;
-    uint64_t block_date = tracker->block_date;
 
     {
       CassStatement* statement = cass_prepared_bind(prepared_ins_transactions);
@@ -745,88 +740,6 @@ public:
       cass_future_set_callback(future, scylla_result_callback, tracker);
       cass_future_free(future);
       cass_statement_free(statement);
-    }
-
-    for(auto item: recv_seq_start) {
-      {
-        CassStatement* statement = cass_prepared_bind(prepared_ins_receipts);
-        size_t pos = 0;
-        cass_statement_bind_int64(statement, pos++, block_num);
-        cass_statement_bind_int64(statement, pos++, block_timestamp);
-        cass_statement_bind_int64(statement, pos++, block_date);
-        cass_statement_bind_int64(statement, pos++, global_seq);
-        cass_statement_bind_string(statement, pos++, eosio::name_to_string(item.first).c_str());
-        cass_statement_bind_int64(statement, pos++, item.second);
-        cass_statement_bind_int64(statement, pos++, recv_seq_max.at(item.first) - item.second + 1);
-
-        tracker->inc_db_req_counter();
-
-        CassFuture* future = cass_session_execute(session, statement);
-        cass_future_set_callback(future, scylla_result_callback, tracker);
-        cass_future_free(future);
-        cass_statement_free(statement);
-      }
-
-      std::unique_lock<std::mutex> lock(date_maps_mtx);
-      if( receipt_date_written[block_date].count(item.first) == 0 )
-      {
-        receipt_date_written[block_date].insert(item.first);
-
-        CassStatement* statement = cass_prepared_bind(prepared_ins_receipt_dates);
-        size_t pos = 0;
-        cass_statement_bind_string(statement, pos++, eosio::name_to_string(item.first).c_str());
-        cass_statement_bind_int64(statement, pos++, block_date);
-
-        tracker->inc_db_req_counter();
-
-        CassFuture* future = cass_session_execute(session, statement);
-        cass_future_set_callback(future, scylla_result_callback, tracker);
-        cass_future_free(future);
-        cass_statement_free(statement);
-      }
-    }
-
-    for(auto item: actions_seen) {
-      for(auto item2: item.second) {
-        uint64_t aname = item2.first;
-        for(uint64_t receiver: item2.second) {
-          CassStatement* statement = cass_prepared_bind(prepared_ins_actions);
-          size_t pos = 0;
-          cass_statement_bind_int64(statement, pos++, block_num);
-          cass_statement_bind_int64(statement, pos++, block_timestamp);
-          cass_statement_bind_int64(statement, pos++, block_date);
-          cass_statement_bind_int64(statement, pos++, global_seq);
-          cass_statement_bind_string(statement, pos++, eosio::name_to_string(item.first).c_str());
-          cass_statement_bind_string(statement, pos++, eosio::name_to_string(aname).c_str());
-          cass_statement_bind_string(statement, pos++, eosio::name_to_string(receiver).c_str());
-
-          tracker->inc_db_req_counter();
-
-          CassFuture* future = cass_session_execute(session, statement);
-          cass_future_set_callback(future, scylla_result_callback, tracker);
-          cass_future_free(future);
-          cass_statement_free(statement);
-        }
-
-        std::unique_lock<std::mutex> lock(date_maps_mtx);
-        if( action_date_written[block_date][item.first].count(aname) == 0 )
-        {
-          action_date_written[block_date][item.first].insert(aname);
-
-          CassStatement* statement = cass_prepared_bind(prepared_ins_action_dates);
-          size_t pos = 0;
-          cass_statement_bind_string(statement, pos++, eosio::name_to_string(item.first).c_str());
-          cass_statement_bind_string(statement, pos++, eosio::name_to_string(aname).c_str());
-          cass_statement_bind_int64(statement, pos++, block_date);
-
-          tracker->inc_db_req_counter();
-
-          CassFuture* future = cass_session_execute(session, statement);
-          cass_future_set_callback(future, scylla_result_callback, tracker);
-          cass_future_free(future);
-          cass_statement_free(statement);
-        }
-      }
     }
 
     std::unique_lock<std::mutex> lock(track_jobs_counter_mtx);
@@ -1009,11 +922,6 @@ public:
           auto recepts_iter = receipt_date_written.begin();
           while( recepts_iter != receipt_date_written.end() && recepts_iter->first < date_max ) {
             recepts_iter = receipt_date_written.erase(recepts_iter);
-          }
-
-          auto actions_iter = action_date_written.begin();
-          while( actions_iter != action_date_written.end() && actions_iter->first < date_max ) {
-            actions_iter = action_date_written.erase(actions_iter);
           }
         }
       }
