@@ -71,7 +71,7 @@ CREATE TABLE receipts
  account_name           ASCII,
  recv_sequence_start    BIGINT,
  recv_sequence_count    BIGINT,
- PRIMARY KEY (block_num, seq, account_name, block_date) 
+ PRIMARY KEY (block_num, seq, account_name, block_date)
 );
 
 
@@ -95,7 +95,8 @@ CREATE TABLE actions
  seq               BIGINT,
  contract          ASCII,
  action            ASCII,
- PRIMARY KEY (block_num, seq, contract, action) 
+ account_name      ASCII, /* receipt recipient */
+ PRIMARY KEY (block_num, seq, contract, action, account_name)
 );
 
 
@@ -119,4 +120,3 @@ CREATE TABLE abi_history
  abi_raw                BLOB,
  PRIMARY KEY (block_num, account_name)
 );
-

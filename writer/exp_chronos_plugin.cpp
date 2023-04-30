@@ -176,6 +176,7 @@ public:
   uint32_t written_irreversible = 0;
   bool     do_store_traces = false;
   uint32_t store_traces_first_block = 0;
+  bool     pointer_3_exists = false;
 
   uint32_t trx_counter = 0;
   uint32_t block_counter = 0;
@@ -301,7 +302,8 @@ public:
         cass_value_get_int64(column1,  &val);
         if( val > 0 ) {
           store_traces_first_block = (uint32_t) val;
-          do_store_traces = 1;
+          do_store_traces = true;
+          pointer_3_exists = true;
           ilog("Database contains traces startig form block ${b}", ("b", store_traces_first_block));
         }
       }
@@ -354,7 +356,7 @@ public:
 
 
     future = cass_session_prepare
-      (session, "INSERT INTO actions (block_num, block_time, block_date, seq, contract, action) VALUES (?,?,?,?,?,?) USING TIMEOUT 100s");
+      (session, "INSERT INTO actions (block_num, block_time, block_date, seq, contract, action, account_name) VALUES (?,?,?,?,?,?,?) USING TIMEOUT 100s");
     check_future(future, "preparing ins_actions");
     prepared_ins_actions = cass_future_get_prepared(future);
     cass_future_free(future);
@@ -579,24 +581,34 @@ public:
       cass_statement_free(statement);
     }
 
+    bool insert_pointer_3 = false;
+
     if( do_store_traces ) {
       tracker_ptr->store_traces = true;
+      if( !pointer_3_exists ) {
+        insert_pointer_3 = true;
+      }
     }
     else {
       if( store_traces_blk != 0 && bb->block_num >= bb->last_irreversible - store_traces_blk ) {
         do_store_traces = true;
         tracker_ptr->store_traces = true;
-
-        CassStatement* statement = cass_prepared_bind(prepared_ins_pointers);
-        size_t pos = 0;
-        cass_statement_bind_int32(statement, pos++, 3); // id=3: lowest block where traces are populated
-        cass_statement_bind_int64(statement, pos++, bb->block_num);
-
-        CassFuture* future = cass_session_execute(session, statement);
-        check_future(future, "Updating pointer id=3");
-        cass_future_free(future);
-        cass_statement_free(statement);
+        insert_pointer_3 = true;
       }
+    }
+
+    if( insert_pointer_3 ) {
+      CassStatement* statement = cass_prepared_bind(prepared_ins_pointers);
+      size_t pos = 0;
+      cass_statement_bind_int32(statement, pos++, 3); // id=3: lowest block where traces are populated
+      cass_statement_bind_int64(statement, pos++, bb->block_num);
+
+      CassFuture* future = cass_session_execute(session, statement);
+      check_future(future, "Updating pointer id=3");
+      cass_future_free(future);
+      cass_statement_free(statement);
+
+      pointer_3_exists = true;
     }
 
     block_track_queue.push(tracker_ptr);
@@ -648,7 +660,7 @@ public:
     uint64_t                                  global_seq = 0;
     std::map<uint64_t, uint64_t>              recv_seq_start;
     std::map<uint64_t, uint64_t>              recv_seq_max;
-    std::map<uint64_t, std::set<uint64_t>>    actions_seen;
+    std::map<uint64_t, std::map<uint64_t, std::set<uint64_t>>>    actions_seen;
 
     for( auto& atrace: trace.action_traces ) {
 
@@ -689,9 +701,7 @@ public:
 
       recv_seq_max.insert_or_assign(receiver.value, receipt->recv_sequence);
 
-      if( receiver == act->account ) {
-        actions_seen[act->account.value].insert(act->name.value);
-      }
+      actions_seen[act->account.value][act->name.value].insert(receiver.value);
     }
 
     if( global_seq == 0 ) {
@@ -777,8 +787,9 @@ public:
     }
 
     for(auto item: actions_seen) {
-      for(auto aname: item.second) {
-        {
+      for(auto item2: item.second) {
+        uint64_t aname = item2.first;
+        for(uint64_t receiver: item2.second) {
           CassStatement* statement = cass_prepared_bind(prepared_ins_actions);
           size_t pos = 0;
           cass_statement_bind_int64(statement, pos++, block_num);
@@ -787,6 +798,7 @@ public:
           cass_statement_bind_int64(statement, pos++, global_seq);
           cass_statement_bind_string(statement, pos++, eosio::name_to_string(item.first).c_str());
           cass_statement_bind_string(statement, pos++, eosio::name_to_string(aname).c_str());
+          cass_statement_bind_string(statement, pos++, eosio::name_to_string(receiver).c_str());
 
           tracker->inc_db_req_counter();
 
