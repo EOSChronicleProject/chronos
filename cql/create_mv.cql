@@ -17,17 +17,17 @@ CREATE INDEX transactions_seq ON transactions (seq);
 CREATE MATERIALIZED VIEW account_receipts AS
     SELECT *
     FROM receipts
-    WHERE block_num IS NOT NULL AND seq IS NOT NULL AND receiver IS NOT NULL AND
+    WHERE block_num IS NOT NULL AND receiver IS NOT NULL AND
           recv_sequence IS NOT NULL AND contract IS NOT NULL AND action IS NOT NULL AND block_date IS NOT NULL
-    PRIMARY KEY ((receiver, block_date), recv_sequence, seq, block_num, contract, action);
+    PRIMARY KEY ((receiver, block_date), recv_sequence, contract, action, block_num);
 
 
 CREATE MATERIALIZED VIEW action_receipts AS
     SELECT *
     FROM receipts
-    WHERE block_num IS NOT NULL AND seq IS NOT NULL AND receiver IS NOT NULL AND
+    WHERE block_num IS NOT NULL AND receiver IS NOT NULL AND
           recv_sequence IS NOT NULL AND contract IS NOT NULL AND action IS NOT NULL AND block_date IS NOT NULL
-    PRIMARY KEY ((receiver, contract, action, block_date), recv_sequence, seq, block_num);
+    PRIMARY KEY ((receiver, contract, action, block_date), recv_sequence, block_num);
 
 
 

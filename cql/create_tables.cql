@@ -72,7 +72,7 @@ CREATE TABLE receipts
  contract               ASCII,
  action                 ASCII,
  recv_sequence          BIGINT,
- PRIMARY KEY (block_num, seq, receiver, recv_sequence, contract, action)
+ PRIMARY KEY (block_num, receiver, contract, action, recv_sequence)
 );
 
 
