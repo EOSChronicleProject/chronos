@@ -65,7 +65,6 @@ CREATE TABLE traces
 CREATE TABLE receipts
 (
  block_num              BIGINT,
- block_time             TIMESTAMP,
  block_date             BIGINT,
  seq                    BIGINT,
  receiver               ASCII,

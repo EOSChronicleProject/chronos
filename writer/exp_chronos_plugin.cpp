@@ -337,7 +337,7 @@ public:
 
     future = cass_session_prepare
       (session,
-       "INSERT INTO receipts (block_num, block_time, block_date, seq, receiver, contract, action, recv_sequence) VALUES (?,?,?,?,?,?,?,?) USING TIMEOUT 100s");
+       "INSERT INTO receipts (block_num, block_date, seq, receiver, contract, action, recv_sequence) VALUES (?,?,?,?,?,?,?) USING TIMEOUT 100s");
     check_future(future, "preparing ins_receipts");
     prepared_ins_receipts = cass_future_get_prepared(future);
     cass_future_free(future);
@@ -669,7 +669,6 @@ public:
         CassStatement* statement = cass_prepared_bind(prepared_ins_receipts);
         size_t pos = 0;
         cass_statement_bind_int64(statement, pos++, block_num);
-        cass_statement_bind_int64(statement, pos++, block_timestamp);
         cass_statement_bind_int64(statement, pos++, block_date);
         cass_statement_bind_int64(statement, pos++, global_seq);
         cass_statement_bind_string(statement, pos++, eosio::name_to_string(receiver.value).c_str());
